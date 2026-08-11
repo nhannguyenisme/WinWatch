@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+logs/
+*.log
+
+data/events.jsonl
+output/events.csv
+output/summary.txt
+output/summary.json
+
+.env
+.DS_Store
+

@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>WinWatch Security Dashboard</title>
+
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+
+<main class="dashboard">
+
+    <header class="topbar">
+
+        <div class="brand">
+
+            <div class="logo">
+                <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                >
+                    <path
+                        d="M12 3 19 6v5c0 4.8-2.8 8.2-7 10-4.2-1.8-7-5.2-7-10V6l7-3Z"
+                    />
+                    <path d="M8.5 12h2l1-3 2 6 1-3h2" />
+                </svg>
+            </div>
+
+            <div class="brand-copy">
+                <h1>WinWatch Security Dashboard</h1>
+
+                <p>
+                    Giám sát hoạt động Windows theo thời gian thực
+                    · Python Security Telemetry
+                    · Nguyễn Thành Nhân
+                </p>
+            </div>
+
+        </div>
+
+        <div class="header-status">
+
+            <div class="meta-pill">
+                TCP Collector
+                <strong>5514</strong>
+            </div>
+
+            <div class="meta-pill">
+                Dashboard
+                <strong>:8080</strong>
+            </div>
+
+            <div class="status-pill">
+                <span
+                    class="status-dot"
+                    id="status-dot"
+                ></span>
+
+                <span id="status-text">
+                    Connecting
+                </span>
+            </div>
+
+        </div>
+
+    </header>
+
+
+    <section class="kpi-grid">
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--cyan);
+                --glow: var(--cyan);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Tổng sự kiện
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <path d="M4 5h16v14H4z"/>
+                        <path d="M8 9h8M8 13h5"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-total"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Telemetry đã thu thập
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--green);
+                --glow: var(--green);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Sự kiện tiến trình
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <rect
+                            x="5"
+                            y="5"
+                            width="14"
+                            height="14"
+                            rx="2"
+                        />
+                        <path d="M9 9h6v6H9z"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-process"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Hoạt động tạo và kết thúc tiến trình
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--blue);
+                --glow: var(--blue);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Kết nối mạng
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <circle cx="12" cy="12" r="8"/>
+                        <path d="M4 12h16M12 4c2 2.2 3 4.8 3 8s-1 5.8-3 8M12 4c-2 2.2-3 4.8-3 8s1 5.8 3 8"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-network"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Telemetry mạng từ Sysmon
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--red);
+                --glow: var(--red);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Đăng nhập thất bại
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <circle cx="12" cy="8" r="3"/>
+                        <path d="M6 19c.8-3 2.8-5 6-5s5.2 2 6 5"/>
+                        <path d="m18 8 3 3M21 8l-3 3"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-login"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Windows Event ID 4625
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--purple);
+                --glow: var(--purple);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Tiến trình khác nhau
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <path d="M5 7h14M5 12h14M5 17h14"/>
+                        <circle cx="8" cy="7" r="1"/>
+                        <circle cx="15" cy="12" r="1"/>
+                        <circle cx="11" cy="17" r="1"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-process-unique"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Số chương trình thực thi khác nhau
+            </div>
+        </article>
+
+    </section>
+
+
+    <section class="grid-primary">
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ◈
+                    </span>
+
+                    <h2>
+                        Phân bố sự kiện Telemetry
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Dữ liệu thời gian thực
+                </span>
+            </div>
+
+            <div class="panel-body event-overview">
+
+                <div class="donut-wrap">
+
+                    <div
+                        class="donut"
+                        id="event-donut"
+                    >
+                        <div class="donut-center">
+                            <span
+                                class="donut-total"
+                                id="donut-total"
+                            >
+                                0
+                            </span>
+
+                            <span class="donut-caption">
+                                SỰ KIỆN
+                            </span>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div
+                    class="distribution"
+                    id="distribution"
+                >
+                    <div class="empty">
+                        Waiting for telemetry...
+                    </div>
+                </div>
+
+            </div>
+
+        </article>
+
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ◉
+                    </span>
+
+                    <h2>
+                        Trạng thái thiết bị
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Trạng thái giám sát
+                </span>
+            </div>
+
+            <div class="panel-body">
+
+                <div
+                    class="host-name"
+                    id="host-name"
+                >
+                    Đang chờ thiết bị...
+
+                    <span>
+                        Thiết bị Windows được giám sát gần nhất
+                    </span>
+                </div>
+
+                
+                <div class="health-row">
+                    <span class="health-label">
+                        Hoạt động Telemetry
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="agent-health"
+                    >
+                        WAITING
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Telemetry gần nhất
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="last-telemetry"
+                    >
+                        -
+                    </span>
+                </div>
+
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Dashboard API
+                    </span>
+
+                    <span
+                        class="health-value health-good"
+                        id="api-health"
+                    >
+                        ONLINE
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        IP đích duy nhất
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="unique-ip"
+                    >
+                        0
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Lỗi kiểm tra dữ liệu
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="data-errors"
+                    >
+                        0
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Tự động cập nhật
+                    </span>
+
+                    <span class="health-value">
+                        2 giây
+                    </span>
+                </div>
+
+            </div>
+
+        </article>
+
+    </section>
+
+
+    <section class="grid-secondary">
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ⌘
+                    </span>
+
+                    <h2>
+                        Tiến trình hoạt động nhiều nhất
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Các chương trình thực thi hoạt động nhiều nhất
+                </span>
+            </div>
+
+            <div class="panel-body">
+
+                <ol
+                    class="ranking"
+                    id="process-ranking"
+                ></ol>
+
+            </div>
+
+        </article>
+
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ◎
+                    </span>
+
+                    <h2>
+                        IP đích phổ biến
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Các địa chỉ mạng đích
+                </span>
+            </div>
+
+            <div class="panel-body">
+
+                <ol
+                    class="ranking"
+                    id="ip-ranking"
+                ></ol>
+
+            </div>
+
+        </article>
+
+    </section>
+
+
+    <section class="panel events-panel">
+
+        <div class="panel-heading">
+
+            <div class="panel-title">
+                <span class="panel-title-icon">
+                    ≋
+                </span>
+
+                <h2>
+                    Luồng sự kiện Windows trực tiếp
+                </h2>
+            </div>
+
+            <div class="events-toolbar">
+
+                <input
+                    class="search-box"
+                    id="event-search"
+                    type="search"
+                    placeholder="Tìm sự kiện, tiến trình, người dùng..."
+                    aria-label="Tìm kiếm sự kiện"
+                >
+
+                <select
+                    class="event-filter"
+                    id="event-filter"
+                    aria-label="Filter event type"
+                >
+                    <option value="">
+                        Tất cả sự kiện
+                    </option>
+                </select>
+
+            </div>
+
+        </div>
+
+
+        <div class="table-container">
+
+            <table>
+
+                <thead>
+                <tr>
+                    <th>Thời gian</th>
+                    <th>Thiết bị</th>
+                    <th>Loại sự kiện</th>
+                    <th>Người dùng / Tiến trình</th>
+                    <th>Chi tiết</th>
+                </tr>
+                </thead>
+
+                <tbody id="event-table">
+
+                <tr>
+                    <td
+                        colspan="5"
+                        class="empty"
+                    >
+                        Đang chờ telemetry Windows...
+                    </td>
+                </tr>
+
+                </tbody>
+
+            </table>
+
+        </div>
+
+    </section>
+
+
+    <footer>
+        <span>
+            WinWatch · Giám sát hoạt động Windows theo thời gian thực System
+        </span>
+
+        <span id="last-update">
+            Đang chờ lần cập nhật đầu tiên
+        </span>
+    </footer>
+
+</main>
+
+
+<script src="/static/app.js"></script>
+
+</body>
+</html>

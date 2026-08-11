@@ -1,0 +1,103 @@
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/main.py
+
+Chức năng:
+    Điểm khởi chạy chính của Ubuntu WinWatch Monitoring Server.
+
+    Module khởi tạo:
+        - EventStore
+        - EventAnalyzer
+        - WinWatch TCP Server
+
+    Sau đó server lắng nghe Windows Client theo thời gian thực.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from ubuntu_server.analyzer import EventAnalyzer
+from ubuntu_server.event_store import EventStore
+from ubuntu_server.server import create_server
+from ubuntu_server.settings import (
+    ALLOWED_CLIENT_IPS,
+    SERVER_HOST,
+    SERVER_PORT,
+    ensure_project_directories,
+)
+
+
+def configure_logging() -> None:
+    """
+    Cấu hình logging cơ bản cho WinWatch.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def display_banner() -> None:
+    """
+    Hiển thị thông tin project khi server khởi động.
+    """
+    print("=" * 72)
+    print(" WINWATCH - REAL-TIME WINDOWS ACTIVITY MONITORING SYSTEM")
+    print("=" * 72)
+    print(" Author        : Nguyễn Thành Nhân")
+    print(f" Listen        : {SERVER_HOST}:{SERVER_PORT}")
+    print(
+        " Allowed IPs   : "
+        + ", ".join(
+            sorted(ALLOWED_CLIENT_IPS)
+        )
+    )
+    print("=" * 72)
+
+
+def main() -> None:
+    """
+    Khởi chạy Ubuntu Monitoring Server.
+    """
+    configure_logging()
+    ensure_project_directories()
+    display_banner()
+
+    event_store = EventStore()
+    analyzer = EventAnalyzer()
+
+    try:
+        with create_server(
+            event_store=event_store,
+            analyzer=analyzer,
+        ) as server:
+            print(
+                "[+] WinWatch server is running."
+            )
+            print(
+                "[+] Press Ctrl+C to stop.\n"
+            )
+
+            server.serve_forever()
+
+    except KeyboardInterrupt:
+        print(
+            "\n[+] WinWatch server stopped by user."
+        )
+
+    except OSError as error:
+        logging.error(
+            "Cannot start WinWatch server: %s",
+            error,
+        )
+
+
+if __name__ == "__main__":
+    main()

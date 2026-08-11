@@ -1,0 +1,455 @@
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/dashboard.py
+
+Chức năng:
+    Cung cấp Web Dashboard cho WinWatch bằng Python standard library.
+
+    Dashboard:
+        - Đọc dữ liệu runtime từ events.jsonl.
+        - Phân tích dữ liệu bằng EventAnalyzer.
+        - Cung cấp REST-like JSON endpoint.
+        - Hiển thị giao diện web theo thời gian gần thực.
+
+    Không sử dụng framework web bên ngoài.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections import deque
+from http.server import (
+    BaseHTTPRequestHandler,
+    ThreadingHTTPServer,
+)
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from ubuntu_server.analyzer import EventAnalyzer
+from ubuntu_server.models import SecurityEvent
+from ubuntu_server.settings import (
+    EVENTS_JSONL_FILE,
+    PROJECT_ROOT,
+)
+
+
+DASHBOARD_HOST = "0.0.0.0"
+DASHBOARD_PORT = 8080
+
+DASHBOARD_HTML_FILE = (
+    PROJECT_ROOT
+    / "dashboard"
+    / "index.html"
+)
+
+MAX_EVENTS_TO_ANALYZE = 2000
+RECENT_EVENT_LIMIT = 30
+
+
+def load_runtime_events(
+    jsonl_file: Path = EVENTS_JSONL_FILE,
+    limit: int = MAX_EVENTS_TO_ANALYZE,
+) -> tuple[list[SecurityEvent], list[str]]:
+    """
+    Đọc các SecurityEvent gần nhất từ JSONL.
+
+    File có thể đang được realtime server ghi đồng thời.
+    Các dòng JSON không hoàn chỉnh hoặc không hợp lệ sẽ được bỏ qua
+    thay vì làm dashboard dừng hoạt động.
+
+    Returns:
+        Tuple:
+            - danh sách SecurityEvent hợp lệ.
+            - danh sách thông báo lỗi.
+    """
+    events: list[SecurityEvent] = []
+    errors: list[str] = []
+
+    if not jsonl_file.exists():
+        return events, errors
+
+    try:
+        with jsonl_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            lines = deque(
+                file,
+                maxlen=max(1, limit),
+            )
+
+    except OSError as error:
+        return [], [
+            f"Cannot read {jsonl_file}: {error}"
+        ]
+
+    for index, line in enumerate(
+        lines,
+        start=1,
+    ):
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            payload = json.loads(line)
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                raise ValueError(
+                    "JSON event must be an object."
+                )
+
+            event = SecurityEvent.from_dict(
+                payload
+            )
+
+            is_valid, validation_errors = (
+                event.validate()
+            )
+
+            if not is_valid:
+                raise ValueError(
+                    "; ".join(
+                        validation_errors
+                    )
+                )
+
+            events.append(event)
+
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(
+                f"Runtime row {index}: {error}"
+            )
+
+    return events, errors
+
+
+def build_dashboard_snapshot(
+    events: list[SecurityEvent],
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Tạo snapshot JSON mà Web Dashboard sử dụng.
+
+    Hàm tái sử dụng EventAnalyzer thay vì viết lại logic thống kê.
+    """
+    analyzer = EventAnalyzer(
+        events
+    )
+
+    summary = analyzer.build_summary()
+
+    recent_events: list[
+        dict[str, Any]
+    ] = []
+
+    for event in reversed(
+        events[-RECENT_EVENT_LIMIT:]
+    ):
+        recent_events.append(
+            {
+                "timestamp": event.timestamp,
+                "hostname": event.hostname,
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "username": event.username,
+                "process": (
+                    event.process_basename()
+                ),
+                "source_ip": event.source_ip,
+                "destination_ip": (
+                    event.destination_ip
+                ),
+                "destination_port": (
+                    event.destination_port
+                ),
+                "target_file": (
+                    event.target_file
+                ),
+                "dns_query": event.dns_query,
+                "summary": event.summary(),
+            }
+        )
+
+    event_counts = summary[
+        "event_counts"
+    ]
+
+    return {
+        "status": "online",
+        "last_event_timestamp": (
+            events[-1].timestamp
+            if events
+            else None
+        ),
+        "total_events": summary[
+            "total_events"
+        ],
+        "login_failures": (
+            event_counts.get(
+                "LOGIN_FAILURE",
+                0,
+            )
+        ),
+        "network_connections": (
+            event_counts.get(
+                "NETWORK_CONNECT",
+                0,
+            )
+        ),
+        "unique_processes": summary[
+            "unique_process_count"
+        ],
+        "unique_destination_ips": (
+            summary[
+                "unique_destination_ip_count"
+            ]
+        ),
+        "event_counts": event_counts,
+        "top_processes": summary[
+            "top_processes"
+        ],
+        "top_destination_ips": summary[
+            "top_destination_ips"
+        ],
+        "login_failure_accounts": (
+            summary["login_failures"]
+        ),
+        "dns_queries": summary[
+            "dns_queries"
+        ],
+        "recent_events": recent_events,
+        "data_errors": (
+            errors or []
+        )[-10:],
+    }
+
+
+def get_dashboard_snapshot() -> dict[str, Any]:
+    """Đọc runtime log và tạo dashboard snapshot."""
+    events, errors = (
+        load_runtime_events()
+    )
+
+    return build_dashboard_snapshot(
+        events,
+        errors,
+    )
+
+
+class WinWatchDashboardHandler(
+    BaseHTTPRequestHandler
+):
+    """
+    HTTP request handler của WinWatch Dashboard.
+    """
+
+    server_version = "WinWatchDashboard/1.0"
+
+    def do_GET(self) -> None:
+        """Xử lý HTTP GET request."""
+        path = urlparse(
+            self.path
+        ).path
+
+        if path == "/":
+            self._serve_dashboard()
+            return
+
+        if path == "/api/dashboard":
+            self._serve_dashboard_api()
+            return
+
+        if path == "/api/health":
+            self._send_json(
+                {
+                    "status": "ok",
+                    "service": (
+                        "WinWatch Dashboard"
+                    ),
+                }
+            )
+            return
+
+        self.send_error(
+            404,
+            "Resource not found.",
+        )
+
+    def _serve_dashboard(self) -> None:
+        """Trả giao diện HTML Dashboard."""
+        try:
+            html = (
+                DASHBOARD_HTML_FILE
+                .read_bytes()
+            )
+
+        except OSError as error:
+            logging.error(
+                "Cannot read dashboard HTML: %s",
+                error,
+            )
+
+            self.send_error(
+                500,
+                "Dashboard HTML unavailable.",
+            )
+            return
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(html)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.end_headers()
+        self.wfile.write(html)
+
+    def _serve_dashboard_api(
+        self,
+    ) -> None:
+        """Trả snapshot realtime ở dạng JSON."""
+        snapshot = (
+            get_dashboard_snapshot()
+        )
+
+        self._send_json(snapshot)
+
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Serialize và gửi JSON response."""
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(
+        self,
+        format_string: str,
+        *args: object,
+    ) -> None:
+        """Đưa HTTP access log vào logging."""
+        logging.info(
+            "Dashboard %s - %s",
+            self.client_address[0],
+            format_string % args,
+        )
+
+
+def create_dashboard_server(
+    host: str = DASHBOARD_HOST,
+    port: int = DASHBOARD_PORT,
+) -> ThreadingHTTPServer:
+    """Khởi tạo HTTP Dashboard Server."""
+    return ThreadingHTTPServer(
+        (host, port),
+        WinWatchDashboardHandler,
+    )
+
+
+def configure_logging() -> None:
+    """Cấu hình log cho Dashboard."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def main() -> None:
+    """Entry point của WinWatch Dashboard."""
+    configure_logging()
+
+    try:
+        with create_dashboard_server() as server:
+            print("=" * 72)
+            print(
+                " WINWATCH - WEB MONITORING "
+                "DASHBOARD"
+            )
+            print("=" * 72)
+            print(
+                " Author : Nguyễn Thành Nhân"
+            )
+            print(
+                f" Listen : "
+                f"{DASHBOARD_HOST}:"
+                f"{DASHBOARD_PORT}"
+            )
+            print(
+                " URL    : "
+                "http://192.168.100.138:8080"
+            )
+            print("=" * 72)
+            print(
+                "[+] Dashboard is running."
+            )
+            print(
+                "[+] Press Ctrl+C to stop.\n"
+            )
+
+            server.serve_forever()
+
+    except KeyboardInterrupt:
+        print(
+            "\n[+] Dashboard stopped."
+        )
+
+    except OSError as error:
+        logging.error(
+            "Cannot start Dashboard: %s",
+            error,
+        )
+
+
+if __name__ == "__main__":
+    main()

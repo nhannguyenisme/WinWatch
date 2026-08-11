@@ -1,0 +1,9 @@
+timestamp,hostname,event_id,event_type,source,username,process_name,command_line,source_ip,destination_ip,destination_port,target_file,dns_query
+2026-08-10T22:00:00+07:00,WIN-CLIENT,1,PROCESS_CREATE,sysmon,Nhan,C:\Windows\System32\notepad.exe,notepad.exe,,,,,
+2026-08-10T22:01:00+07:00,WIN-CLIENT,5,PROCESS_TERMINATE,sysmon,Nhan,C:\Windows\System32\notepad.exe,,,,,,
+2026-08-10T22:02:00+07:00,WIN-CLIENT,4624,LOGIN_SUCCESS,security,Nhan,,,192.168.100.135,,,,
+2026-08-10T22:03:00+07:00,WIN-CLIENT,4625,LOGIN_FAILURE,security,Nhan,,,192.168.100.135,,,,
+2026-08-10T22:04:00+07:00,WIN-CLIENT,3,NETWORK_CONNECT,sysmon,Nhan,C:\Program Files\Google\Chrome\Application\chrome.exe,,192.168.100.135,1.1.1.1,443,,
+2026-08-10T22:05:00+07:00,WIN-CLIENT,11,FILE_CREATE,sysmon,Nhan,C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe,,,,,C:\WinWatchDemo\demo.txt,
+2026-08-10T22:06:00+07:00,WIN-CLIENT,26,FILE_DELETE,sysmon,Nhan,C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe,,,,,C:\WinWatchDemo\demo.txt,
+2026-08-10T22:07:00+07:00,WIN-CLIENT,22,DNS_QUERY,sysmon,Nhan,C:\Windows\System32\nslookup.exe,,,,,,example.com

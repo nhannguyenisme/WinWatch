@@ -1,0 +1,5136 @@
+WINWATCH UBUNTU SOURCE
+
+==============================================================================
+FILE: ubuntu_server/__init__.py
+==============================================================================
+
+==============================================================================
+FILE: ubuntu_server/settings.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/settings.py
+
+Chức năng:
+    Quản lý các tham số cấu hình dùng chung cho Ubuntu Monitoring Server.
+
+    Module tập trung địa chỉ mạng, đường dẫn dữ liệu và các Event ID
+    nhằm tránh sử dụng giá trị cố định rải rác trong source code.
+"""
+
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Project directories
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DATA_DIR = PROJECT_ROOT / "data"
+OUTPUT_DIR = PROJECT_ROOT / "output"
+
+EVENTS_JSONL_FILE = DATA_DIR / "events.jsonl"
+EVENTS_CSV_FILE = OUTPUT_DIR / "events.csv"
+ALERTS_JSON_FILE = OUTPUT_DIR / "alerts.json"
+SUMMARY_FILE = OUTPUT_DIR / "summary.txt"
+
+
+# ---------------------------------------------------------------------------
+# Network configuration
+# ---------------------------------------------------------------------------
+
+# Ubuntu lắng nghe trên tất cả IPv4 interface.
+SERVER_HOST = "0.0.0.0"
+
+# Cổng riêng của WinWatch trong mạng lab.
+SERVER_PORT = 5514
+
+
+# ---------------------------------------------------------------------------
+# Windows / Sysmon Event IDs
+# ---------------------------------------------------------------------------
+
+SYSMON_PROCESS_CREATE = 1
+SYSMON_NETWORK_CONNECT = 3
+SYSMON_PROCESS_TERMINATE = 5
+SYSMON_FILE_CREATE = 11
+SYSMON_DNS_QUERY = 22
+SYSMON_FILE_DELETE = 26
+
+WINDOWS_LOGIN_SUCCESS = 4624
+WINDOWS_LOGIN_FAILURE = 4625
+
+
+EVENT_TYPES = {
+    SYSMON_PROCESS_CREATE: "PROCESS_CREATE",
+    SYSMON_NETWORK_CONNECT: "NETWORK_CONNECT",
+    SYSMON_PROCESS_TERMINATE: "PROCESS_TERMINATE",
+    SYSMON_FILE_CREATE: "FILE_CREATE",
+    SYSMON_DNS_QUERY: "DNS_QUERY",
+    SYSMON_FILE_DELETE: "FILE_DELETE",
+    WINDOWS_LOGIN_SUCCESS: "LOGIN_SUCCESS",
+    WINDOWS_LOGIN_FAILURE: "LOGIN_FAILURE",
+}
+
+
+# Logon types liên quan trực tiếp đến hoạt động tương tác của người dùng.
+INTERACTIVE_LOGON_TYPES = {
+    2,   # Interactive
+    7,   # Unlock
+    10,  # RemoteInteractive (RDP)
+    11,  # CachedInteractive
+}
+
+
+def ensure_project_directories() -> None:
+    """
+    Đảm bảo các thư mục lưu dữ liệu và báo cáo tồn tại.
+
+    Hàm này được gọi khi Ubuntu Monitoring Server khởi động để chương
+    trình không phụ thuộc vào việc người dùng tạo thư mục thủ công.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+# ---------------------------------------------------------------------------
+# TCP security / protocol configuration
+# ---------------------------------------------------------------------------
+
+# Chỉ Windows Client của lab và localhost được phép kết nối tới WinWatch.
+# Localhost được giữ lại để phục vụ unit test và kiểm thử nội bộ.
+ALLOWED_CLIENT_IPS = {
+    "192.168.100.135",
+    "127.0.0.1",
+}
+
+# Giới hạn kích thước tối đa của một JSON event.
+# Event vượt giới hạn sẽ bị từ chối để tránh tiêu thụ bộ nhớ không cần thiết.
+MAX_EVENT_BYTES = 65_536
+
+
+# ---------------------------------------------------------------------------
+# Analysis report files
+# ---------------------------------------------------------------------------
+
+SUMMARY_JSON_FILE = OUTPUT_DIR / "summary.json"
+
+==============================================================================
+FILE: ubuntu_server/models.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/models.py
+
+Chức năng:
+    Định nghĩa các mô hình dữ liệu chính của WinWatch.
+
+    SecurityEvent đại diện cho một sự kiện bảo mật hoặc sự kiện hệ thống
+    được thu thập từ Windows Client thông qua Windows Security Log hoặc Sysmon.
+
+    Lớp chịu trách nhiệm:
+        - Lưu trữ các thuộc tính của sự kiện.
+        - Chuẩn hóa dữ liệu đầu vào.
+        - Kiểm tra tính hợp lệ của dữ liệu.
+        - Chuyển object thành dictionary để lưu CSV/JSON.
+        - Tạo nội dung tóm tắt phục vụ realtime monitoring.
+
+Author:
+    Nguyễn Thành Nhân
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from ipaddress import ip_address
+from typing import Any
+
+from ubuntu_server.settings import EVENT_TYPES
+
+
+class SecurityEvent:
+    """
+    Mô hình hóa một sự kiện được WinWatch nhận từ Windows Client.
+
+    Mỗi object SecurityEvent đại diện cho một event duy nhất, ví dụ:
+    process creation, login failure, network connection hoặc DNS query.
+    """
+
+    def __init__(
+        self,
+        timestamp: str,
+        hostname: str,
+        event_id: int,
+        source: str,
+        username: str = "",
+        process_name: str = "",
+        command_line: str = "",
+        source_ip: str = "",
+        destination_ip: str = "",
+        destination_port: int | None = None,
+        target_file: str = "",
+        dns_query: str = "",
+    ) -> None:
+        self.timestamp = self._normalize_text(timestamp)
+        self.hostname = self._normalize_text(hostname)
+        self.event_id = int(event_id)
+        self.source = self._normalize_text(source).lower()
+
+        self.username = self._normalize_text(username)
+        self.process_name = self._normalize_path(process_name)
+        self.command_line = self._normalize_text(command_line)
+
+        self.source_ip = self._normalize_text(source_ip)
+        self.destination_ip = self._normalize_text(destination_ip)
+        self.destination_port = destination_port
+
+        self.target_file = self._normalize_path(target_file)
+        self.dns_query = self._normalize_text(dns_query).lower()
+
+        # Event type được xác định tập trung từ settings.py để tránh
+        # hard-code Event ID ở nhiều module khác nhau.
+        self.event_type = EVENT_TYPES.get(
+            self.event_id,
+            f"UNKNOWN_{self.event_id}",
+        )
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        """
+        Chuẩn hóa một giá trị về chuỗi và loại bỏ khoảng trắng dư thừa.
+
+        Args:
+            value: Giá trị đầu vào cần chuẩn hóa.
+
+        Returns:
+            Chuỗi đã được chuẩn hóa.
+        """
+        if value is None:
+            return ""
+
+        return str(value).strip()
+
+    @classmethod
+    def _normalize_path(cls, value: Any) -> str:
+        """
+        Chuẩn hóa đường dẫn Windows để dữ liệu thống nhất khi phân tích.
+
+        Args:
+            value: Đường dẫn hoặc tên process/file.
+
+        Returns:
+            Đường dẫn đã loại bỏ khoảng trắng dư thừa.
+        """
+        return cls._normalize_text(value)
+
+    def validate(self) -> tuple[bool, list[str]]:
+        """
+        Kiểm tra các ràng buộc dữ liệu quan trọng của sự kiện.
+
+        Returns:
+            Tuple gồm:
+                - True/False thể hiện event hợp lệ hay không.
+                - Danh sách lỗi phát hiện được.
+        """
+        errors: list[str] = []
+
+        if not self.hostname:
+            errors.append("Hostname không được để trống.")
+
+        if self.event_id <= 0:
+            errors.append("Event ID phải lớn hơn 0.")
+
+        if self.source not in {"sysmon", "security", "csv"}:
+            errors.append(
+                "Nguồn sự kiện phải là sysmon, security hoặc csv."
+            )
+
+        if self.destination_port is not None:
+            if not 0 <= self.destination_port <= 65535:
+                errors.append(
+                    "Destination port phải nằm trong khoảng 0-65535."
+                )
+
+        for field_name, ip_value in (
+            ("source_ip", self.source_ip),
+            ("destination_ip", self.destination_ip),
+        ):
+            if ip_value and not self._is_valid_ip(ip_value):
+                errors.append(
+                    f"{field_name} không phải địa chỉ IP hợp lệ: "
+                    f"{ip_value}"
+                )
+
+        return len(errors) == 0, errors
+
+    @staticmethod
+    def _is_valid_ip(value: str) -> bool:
+        """
+        Kiểm tra một chuỗi có phải địa chỉ IPv4/IPv6 hợp lệ hay không.
+
+        Args:
+            value: Chuỗi địa chỉ IP.
+
+        Returns:
+            True nếu hợp lệ, ngược lại False.
+        """
+        try:
+            ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+    def is_login_event(self) -> bool:
+        """
+        Kiểm tra event hiện tại có thuộc nhóm đăng nhập hay không.
+        """
+        return self.event_type in {
+            "LOGIN_SUCCESS",
+            "LOGIN_FAILURE",
+        }
+
+    def is_network_event(self) -> bool:
+        """
+        Kiểm tra event hiện tại có phải kết nối mạng hay không.
+        """
+        return self.event_type == "NETWORK_CONNECT"
+
+    def is_file_event(self) -> bool:
+        """
+        Kiểm tra event hiện tại có phải hoạt động file hay không.
+        """
+        return self.event_type in {
+            "FILE_CREATE",
+            "FILE_DELETE",
+        }
+
+    def process_basename(self) -> str:
+        """
+        Lấy tên executable từ đường dẫn đầy đủ của process.
+
+        Ví dụ:
+            C:\\Windows\\System32\\cmd.exe
+            -> cmd.exe
+        """
+        if not self.process_name:
+            return ""
+
+        normalized = self.process_name.replace("\\", "/")
+
+        return normalized.rsplit("/", maxsplit=1)[-1].lower()
+
+    def summary(self) -> str:
+        """
+        Sinh nội dung tóm tắt ngắn phục vụ màn hình realtime.
+
+        Returns:
+            Chuỗi mô tả sự kiện theo từng event type.
+        """
+        if self.event_type == "PROCESS_CREATE":
+            process = self.process_basename()
+            return f"{process} {self.command_line}".strip()
+
+        if self.event_type == "PROCESS_TERMINATE":
+            return self.process_basename()
+
+        if self.event_type in {
+            "LOGIN_SUCCESS",
+            "LOGIN_FAILURE",
+        }:
+            username = self.username or "unknown"
+            source_ip = self.source_ip or "-"
+
+            return f"user={username} src={source_ip}"
+
+        if self.event_type == "NETWORK_CONNECT":
+            process = self.process_basename() or "unknown"
+
+            destination = self.destination_ip or "-"
+            if self.destination_port is not None:
+                destination = (
+                    f"{destination}:{self.destination_port}"
+                )
+
+            return f"{process} -> {destination}"
+
+        if self.event_type in {
+            "FILE_CREATE",
+            "FILE_DELETE",
+        }:
+            return self.target_file
+
+        if self.event_type == "DNS_QUERY":
+            process = self.process_basename() or "unknown"
+            return f"{process} -> {self.dns_query}"
+
+        return self.event_type
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Chuyển SecurityEvent object thành dictionary.
+
+        Dictionary này sẽ được tái sử dụng khi:
+            - Xuất CSV.
+            - Xuất JSON.
+            - Lưu event.
+            - Phân tích thống kê.
+
+        Returns:
+            Dictionary chứa toàn bộ dữ liệu của event.
+        """
+        return {
+            "timestamp": self.timestamp,
+            "hostname": self.hostname,
+            "event_id": self.event_id,
+            "event_type": self.event_type,
+            "source": self.source,
+            "username": self.username,
+            "process_name": self.process_name,
+            "command_line": self.command_line,
+            "source_ip": self.source_ip,
+            "destination_ip": self.destination_ip,
+            "destination_port": self.destination_port,
+            "target_file": self.target_file,
+            "dns_query": self.dns_query,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SecurityEvent:
+        """
+        Tạo SecurityEvent object từ dictionary.
+
+        Phương thức này được sử dụng cho cả dữ liệu realtime và dữ liệu
+        được đọc lại từ file CSV/JSON.
+
+        Args:
+            data: Dictionary chứa dữ liệu event.
+
+        Returns:
+            SecurityEvent object.
+
+        Raises:
+            ValueError:
+                Khi event_id hoặc destination_port không thể chuyển
+                thành kiểu số hợp lệ.
+        """
+        raw_port = data.get("destination_port")
+
+        destination_port: int | None = None
+
+        if raw_port not in (None, ""):
+            try:
+                destination_port = int(raw_port)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Destination port không hợp lệ: {raw_port}"
+                ) from error
+
+        try:
+            event_id = int(data.get("event_id", 0))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Event ID không hợp lệ: {data.get('event_id')}"
+            ) from error
+
+        return cls(
+            timestamp=data.get("timestamp", ""),
+            hostname=data.get("hostname", ""),
+            event_id=event_id,
+            source=data.get("source", ""),
+            username=data.get("username", ""),
+            process_name=data.get("process_name", ""),
+            command_line=data.get("command_line", ""),
+            source_ip=data.get("source_ip", ""),
+            destination_ip=data.get("destination_ip", ""),
+            destination_port=destination_port,
+            target_file=data.get("target_file", ""),
+            dns_query=data.get("dns_query", ""),
+        )
+
+    def __repr__(self) -> str:
+        """
+        Biểu diễn object ngắn gọn phục vụ debug.
+        """
+        return (
+            "SecurityEvent("
+            f"hostname={self.hostname!r}, "
+            f"event_id={self.event_id}, "
+            f"event_type={self.event_type!r}"
+            ")"
+        )
+
+
+def current_timestamp() -> str:
+    """
+    Trả về timestamp hiện tại theo chuẩn ISO 8601.
+
+    Returns:
+        Timestamp dạng YYYY-MM-DDTHH:MM:SS.
+    """
+    return datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+
+==============================================================================
+FILE: ubuntu_server/event_store.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/event_store.py
+
+Chức năng:
+    Lưu các SecurityEvent mà WinWatch nhận được xuống tệp.
+
+    Module hỗ trợ:
+        - Lưu dữ liệu gốc dạng JSON Lines (.jsonl).
+        - Lưu dữ liệu dạng bảng CSV.
+        - Kiểm tra event trước khi ghi.
+        - Xử lý lỗi I/O rõ ràng.
+        - Hỗ trợ nhiều luồng ghi dữ liệu an toàn.
+
+    JSONL được sử dụng để lưu từng event theo từng dòng JSON.
+    CSV được sử dụng cho chức năng phân tích offline và xuất báo cáo.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import threading
+from pathlib import Path
+from typing import Any
+
+from ubuntu_server.models import SecurityEvent
+from ubuntu_server.settings import (
+    EVENTS_CSV_FILE,
+    EVENTS_JSONL_FILE,
+    ensure_project_directories,
+)
+
+
+class EventStorageError(RuntimeError):
+    """Lỗi xảy ra khi WinWatch không thể ghi dữ liệu xuống tệp."""
+
+
+class EventStore:
+    """
+    Quản lý việc lưu SecurityEvent xuống JSONL và CSV.
+
+    Một EventStore object có thể được tái sử dụng trong toàn bộ thời gian
+    Ubuntu Monitoring Server hoạt động.
+    """
+
+    def __init__(
+        self,
+        jsonl_file: Path = EVENTS_JSONL_FILE,
+        csv_file: Path = EVENTS_CSV_FILE,
+    ) -> None:
+        self.jsonl_file = Path(jsonl_file)
+        self.csv_file = Path(csv_file)
+
+        # TCP server sau này có thể xử lý nhiều Windows client bằng thread.
+        # Lock giúp tránh hai thread ghi vào cùng một file đồng thời.
+        self._write_lock = threading.Lock()
+
+        ensure_project_directories()
+
+        self.jsonl_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.csv_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    def save_event(self, event: SecurityEvent) -> None:
+        """
+        Kiểm tra và lưu một SecurityEvent xuống JSONL và CSV.
+
+        Args:
+            event: SecurityEvent cần lưu.
+
+        Raises:
+            TypeError:
+                Nếu đối tượng truyền vào không phải SecurityEvent.
+
+            ValueError:
+                Nếu dữ liệu event không hợp lệ.
+
+            EventStorageError:
+                Nếu xảy ra lỗi khi ghi file.
+        """
+        if not isinstance(event, SecurityEvent):
+            raise TypeError(
+                "event phải là một SecurityEvent object."
+            )
+
+        is_valid, errors = event.validate()
+
+        if not is_valid:
+            error_message = "; ".join(errors)
+            raise ValueError(
+                f"Không thể lưu event không hợp lệ: {error_message}"
+            )
+
+        event_data = event.to_dict()
+
+        try:
+            with self._write_lock:
+                self._append_jsonl(event_data)
+                self._append_csv(event_data)
+
+        except OSError as error:
+            raise EventStorageError(
+                f"Không thể ghi dữ liệu event: {error}"
+            ) from error
+
+    def _append_jsonl(
+        self,
+        event_data: dict[str, Any],
+    ) -> None:
+        """
+        Ghi một dictionary thành một dòng JSON trong file JSONL.
+        """
+        with self.jsonl_file.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                event_data,
+                file,
+                ensure_ascii=False,
+            )
+            file.write("\n")
+
+    def _append_csv(
+        self,
+        event_data: dict[str, Any],
+    ) -> None:
+        """
+        Ghi một dictionary thành một dòng trong file CSV.
+
+        Header chỉ được tạo khi file chưa tồn tại hoặc đang rỗng.
+        """
+        file_has_data = (
+            self.csv_file.exists()
+            and self.csv_file.stat().st_size > 0
+        )
+
+        with self.csv_file.open(
+            "a",
+            encoding="utf-8",
+            newline="",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=list(event_data.keys()),
+            )
+
+            if not file_has_data:
+                writer.writeheader()
+
+            writer.writerow(event_data)
+
+    def count_jsonl_events(self) -> int:
+        """
+        Đếm số event hiện đang lưu trong JSONL.
+
+        Returns:
+            Số dòng dữ liệu hợp lệ trong file.
+        """
+        if not self.jsonl_file.exists():
+            return 0
+
+        with self.jsonl_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            return sum(
+                1
+                for line in file
+                if line.strip()
+            )
+
+    def count_csv_events(self) -> int:
+        """
+        Đếm số event trong CSV, không tính dòng header.
+
+        Returns:
+            Số event đã lưu.
+        """
+        if not self.csv_file.exists():
+            return 0
+
+        with self.csv_file.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as file:
+            reader = csv.DictReader(file)
+            return sum(1 for _ in reader)
+
+==============================================================================
+FILE: ubuntu_server/file_loader.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/file_loader.py
+
+Chức năng:
+    Đọc dữ liệu sự kiện từ file CSV để phục vụ chế độ Offline Analysis.
+
+    Module thực hiện:
+        - Kiểm tra file tồn tại và quyền truy cập.
+        - Kiểm tra các cột bắt buộc.
+        - Chuẩn hóa tên cột và dữ liệu chuỗi.
+        - Chuyển từng dòng CSV thành SecurityEvent object.
+        - Bỏ qua dòng lỗi nhưng vẫn tiếp tục xử lý các dòng hợp lệ.
+        - Trả về danh sách event và danh sách lỗi để người dùng kiểm tra.
+
+Tác giả:
+    Nguyễn Thành Nhân
+"""
+
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from typing import Any
+
+from ubuntu_server.models import SecurityEvent
+
+
+REQUIRED_COLUMNS = {
+    "timestamp",
+    "hostname",
+    "event_id",
+    "source",
+}
+
+
+class CSVLoadError(RuntimeError):
+    """Lỗi xảy ra khi WinWatch không thể đọc file CSV."""
+
+
+class MissingColumnsError(CSVLoadError):
+    """Lỗi xảy ra khi file CSV thiếu cột bắt buộc."""
+
+
+def normalize_column_name(value: str) -> str:
+    """
+    Chuẩn hóa tên cột CSV.
+
+    Ví dụ:
+        " Event ID " -> "event_id"
+
+    Args:
+        value: Tên cột cần chuẩn hóa.
+
+    Returns:
+        Tên cột theo dạng lowercase và snake_case đơn giản.
+    """
+    return (
+        value
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("\ufeff", "")
+    )
+
+
+def normalize_csv_value(value: Any) -> str:
+    """
+    Chuẩn hóa giá trị đọc từ CSV.
+
+    Args:
+        value: Giá trị cần xử lý.
+
+    Returns:
+        Chuỗi đã loại bỏ khoảng trắng thừa.
+    """
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+class EventFileLoader:
+    """
+    Đọc và chuyển dữ liệu CSV thành danh sách SecurityEvent.
+    """
+
+    def __init__(
+        self,
+        required_columns: set[str] | None = None,
+    ) -> None:
+        self.required_columns = (
+            set(required_columns)
+            if required_columns is not None
+            else set(REQUIRED_COLUMNS)
+        )
+
+    def load_csv(
+        self,
+        file_path: str | Path,
+    ) -> tuple[list[SecurityEvent], list[str]]:
+        """
+        Đọc file CSV và tạo SecurityEvent objects.
+
+        Args:
+            file_path:
+                Đường dẫn tới file CSV.
+
+        Returns:
+            Tuple gồm:
+                - Danh sách SecurityEvent hợp lệ.
+                - Danh sách thông báo lỗi của các dòng không hợp lệ.
+
+        Raises:
+            CSVLoadError:
+                Khi file không tồn tại, không có quyền đọc hoặc
+                có lỗi định dạng CSV.
+
+            MissingColumnsError:
+                Khi file thiếu cột bắt buộc.
+        """
+        csv_path = Path(file_path)
+
+        events: list[SecurityEvent] = []
+        errors: list[str] = []
+
+        try:
+            with csv_path.open(
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as file:
+                reader = csv.DictReader(file)
+
+                if reader.fieldnames is None:
+                    raise CSVLoadError(
+                        "File CSV không có dòng tiêu đề."
+                    )
+
+                normalized_headers = [
+                    normalize_column_name(header)
+                    for header in reader.fieldnames
+                ]
+
+                reader.fieldnames = normalized_headers
+
+                self._validate_columns(
+                    normalized_headers
+                )
+
+                for row_number, row in enumerate(
+                    reader,
+                    start=2,
+                ):
+                    normalized_row = self._normalize_row(
+                        row
+                    )
+
+                    # Bỏ qua dòng trống hoàn toàn.
+                    if not any(normalized_row.values()):
+                        continue
+
+                    try:
+                        event = SecurityEvent.from_dict(
+                            normalized_row
+                        )
+
+                        is_valid, validation_errors = (
+                            event.validate()
+                        )
+
+                        if not is_valid:
+                            errors.append(
+                                f"Dòng {row_number}: "
+                                + "; ".join(
+                                    validation_errors
+                                )
+                            )
+                            continue
+
+                        events.append(event)
+
+                    except ValueError as error:
+                        errors.append(
+                            f"Dòng {row_number}: {error}"
+                        )
+
+        except FileNotFoundError as error:
+            raise CSVLoadError(
+                f"Không tìm thấy file CSV: {csv_path}"
+            ) from error
+
+        except PermissionError as error:
+            raise CSVLoadError(
+                f"Không có quyền đọc file: {csv_path}"
+            ) from error
+
+        except csv.Error as error:
+            raise CSVLoadError(
+                f"File CSV không hợp lệ: {error}"
+            ) from error
+
+        return events, errors
+
+    def _validate_columns(
+        self,
+        headers: list[str],
+    ) -> None:
+        """
+        Kiểm tra các cột bắt buộc có tồn tại hay không.
+        """
+        available_columns = set(headers)
+
+        missing_columns = (
+            self.required_columns
+            - available_columns
+        )
+
+        if missing_columns:
+            missing_text = ", ".join(
+                sorted(missing_columns)
+            )
+
+            raise MissingColumnsError(
+                "File CSV thiếu các cột bắt buộc: "
+                f"{missing_text}"
+            )
+
+    @staticmethod
+    def _normalize_row(
+        row: dict[str, Any],
+    ) -> dict[str, str]:
+        """
+        Chuẩn hóa toàn bộ key/value của một dòng CSV.
+        """
+        normalized_row: dict[str, str] = {}
+
+        for key, value in row.items():
+            normalized_key = normalize_column_name(
+                key or ""
+            )
+
+            normalized_value = normalize_csv_value(
+                value
+            )
+
+            normalized_row[
+                normalized_key
+            ] = normalized_value
+
+        return normalized_row
+
+==============================================================================
+FILE: ubuntu_server/analyzer.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/analyzer.py
+
+Chức năng:
+    Phân tích các SecurityEvent do WinWatch thu thập.
+
+    Module cung cấp:
+        - Thống kê số event theo loại.
+        - Thống kê đăng nhập thất bại theo username.
+        - Thống kê process.
+        - Thống kê destination IP.
+        - Thống kê DNS query.
+        - Xác định process và IP duy nhất.
+        - Xếp hạng các giá trị xuất hiện nhiều nhất.
+
+Cấu trúc dữ liệu được sử dụng:
+    dict:
+        Gom nhóm và đếm dữ liệu.
+
+    set:
+        Loại bỏ giá trị trùng lặp.
+
+    tuple:
+        Biểu diễn các cặp (giá trị, số lần xuất hiện)
+        trong kết quả xếp hạng.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ubuntu_server.models import SecurityEvent
+
+
+class EventAnalyzer:
+    """
+    Phân tích một tập SecurityEvent.
+    """
+
+    def __init__(
+        self,
+        events: list[SecurityEvent] | None = None,
+    ) -> None:
+        self.events: list[SecurityEvent] = []
+
+        if events:
+            for event in events:
+                self.add_event(event)
+
+    def add_event(
+        self,
+        event: SecurityEvent,
+    ) -> None:
+        """
+        Thêm một event hợp lệ vào tập dữ liệu phân tích.
+        """
+        if not isinstance(
+            event,
+            SecurityEvent,
+        ):
+            raise TypeError(
+                "event phải là SecurityEvent object."
+            )
+
+        is_valid, errors = event.validate()
+
+        if not is_valid:
+            raise ValueError(
+                "Event không hợp lệ: "
+                + "; ".join(errors)
+            )
+
+        self.events.append(event)
+
+    def event_counts(self) -> dict[str, int]:
+        """
+        Đếm số lượng event theo từng event_type.
+        """
+        counts: dict[str, int] = {}
+
+        for event in self.events:
+            event_type = event.event_type
+
+            counts[event_type] = (
+                counts.get(event_type, 0)
+                + 1
+            )
+
+        return counts
+
+    def process_counts(self) -> dict[str, int]:
+        """
+        Đếm số lần process xuất hiện trong dữ liệu.
+        """
+        counts: dict[str, int] = {}
+
+        for event in self.events:
+            process_name = (
+                event.process_basename()
+            )
+
+            if not process_name:
+                continue
+
+            counts[process_name] = (
+                counts.get(process_name, 0)
+                + 1
+            )
+
+        return counts
+
+    def login_failure_counts(
+        self,
+    ) -> dict[str, int]:
+        """
+        Đếm số lần đăng nhập thất bại theo username.
+        """
+        counts: dict[str, int] = {}
+
+        for event in self.events:
+            if (
+                event.event_type
+                != "LOGIN_FAILURE"
+            ):
+                continue
+
+            username = (
+                event.username
+                or "unknown"
+            )
+
+            counts[username] = (
+                counts.get(username, 0)
+                + 1
+            )
+
+        return counts
+
+    def destination_ip_counts(
+        self,
+    ) -> dict[str, int]:
+        """
+        Đếm số lần kết nối tới từng destination IP.
+        """
+        counts: dict[str, int] = {}
+
+        for event in self.events:
+            destination_ip = (
+                event.destination_ip
+            )
+
+            if not destination_ip:
+                continue
+
+            counts[destination_ip] = (
+                counts.get(destination_ip, 0)
+                + 1
+            )
+
+        return counts
+
+    def dns_query_counts(
+        self,
+    ) -> dict[str, int]:
+        """
+        Đếm số lần từng domain được truy vấn.
+        """
+        counts: dict[str, int] = {}
+
+        for event in self.events:
+            query = event.dns_query
+
+            if not query:
+                continue
+
+            query = query.lower()
+
+            counts[query] = (
+                counts.get(query, 0)
+                + 1
+            )
+
+        return counts
+
+    def unique_processes(self) -> set[str]:
+        """
+        Trả về tập hợp process không trùng lặp.
+        """
+        processes: set[str] = set()
+
+        for event in self.events:
+            process_name = (
+                event.process_basename()
+            )
+
+            if process_name:
+                processes.add(process_name)
+
+        return processes
+
+    def unique_destination_ips(
+        self,
+    ) -> set[str]:
+        """
+        Trả về tập hợp destination IP không trùng lặp.
+        """
+        destination_ips: set[str] = set()
+
+        for event in self.events:
+            if event.destination_ip:
+                destination_ips.add(
+                    event.destination_ip
+                )
+
+        return destination_ips
+
+    @staticmethod
+    def rank_counts(
+        counts: dict[str, int],
+        limit: int = 5,
+    ) -> list[tuple[str, int]]:
+        """
+        Xếp hạng dictionary theo số lần xuất hiện giảm dần.
+
+        Args:
+            counts:
+                Dictionary cần xếp hạng.
+
+            limit:
+                Số kết quả tối đa.
+
+        Returns:
+            Danh sách tuple:
+                (giá trị, số lần xuất hiện)
+        """
+        if limit <= 0:
+            return []
+
+        ranked_items = sorted(
+            counts.items(),
+            key=lambda item: (
+                -item[1],
+                item[0],
+            ),
+        )
+
+        return ranked_items[:limit]
+
+    def top_processes(
+        self,
+        limit: int = 5,
+    ) -> list[tuple[str, int]]:
+        """
+        Trả về các process xuất hiện nhiều nhất.
+        """
+        return self.rank_counts(
+            self.process_counts(),
+            limit,
+        )
+
+    def top_destination_ips(
+        self,
+        limit: int = 5,
+    ) -> list[tuple[str, int]]:
+        """
+        Trả về các destination IP xuất hiện nhiều nhất.
+        """
+        return self.rank_counts(
+            self.destination_ip_counts(),
+            limit,
+        )
+
+    def build_summary(self) -> dict[str, Any]:
+        """
+        Tạo báo cáo thống kê tổng hợp.
+
+        Returns:
+            Dictionary chứa các kết quả phân tích chính.
+        """
+        return {
+            "total_events": len(self.events),
+            "event_counts": self.event_counts(),
+            "unique_process_count": len(
+                self.unique_processes()
+            ),
+            "unique_destination_ip_count": len(
+                self.unique_destination_ips()
+            ),
+            "login_failures": (
+                self.login_failure_counts()
+            ),
+            "top_processes": (
+                self.top_processes()
+            ),
+            "top_destination_ips": (
+                self.top_destination_ips()
+            ),
+            "dns_queries": (
+                self.dns_query_counts()
+            ),
+        }
+
+==============================================================================
+FILE: ubuntu_server/report_exporter.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/report_exporter.py
+
+Chức năng:
+    Xuất kết quả phân tích của WinWatch ra các tệp báo cáo dễ đọc.
+
+    Module sử dụng kết quả từ EventAnalyzer và tạo:
+        - summary.txt  : báo cáo dành cho người đọc.
+        - summary.json : báo cáo có cấu trúc dành cho xử lý tự động.
+
+Tác giả:
+    Nguyễn Thành Nhân
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from ubuntu_server.analyzer import EventAnalyzer
+from ubuntu_server.settings import (
+    SUMMARY_FILE,
+    SUMMARY_JSON_FILE,
+)
+
+
+class ReportExporter:
+    """
+    Xuất kết quả phân tích của EventAnalyzer thành TXT và JSON.
+    """
+
+    def __init__(
+        self,
+        text_file: Path = SUMMARY_FILE,
+        json_file: Path = SUMMARY_JSON_FILE,
+    ) -> None:
+        self.text_file = Path(text_file)
+        self.json_file = Path(json_file)
+
+        self.text_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.json_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    def export(
+        self,
+        analyzer: EventAnalyzer,
+        source_name: str = "runtime",
+    ) -> tuple[Path, Path]:
+        """
+        Xuất kết quả phân tích ra TXT và JSON.
+
+        Args:
+            analyzer:
+                EventAnalyzer chứa tập event đã được phân tích.
+
+            source_name:
+                Tên nguồn dữ liệu, ví dụ sample_events.csv.
+
+        Returns:
+            Tuple gồm đường dẫn file TXT và JSON.
+
+        Raises:
+            TypeError:
+                Nếu analyzer không phải EventAnalyzer.
+        """
+        if not isinstance(
+            analyzer,
+            EventAnalyzer,
+        ):
+            raise TypeError(
+                "analyzer phải là EventAnalyzer object."
+            )
+
+        report = {
+            "project": (
+                "WinWatch - Real-Time Windows "
+                "Activity Monitoring System"
+            ),
+            "author": "Nguyễn Thành Nhân",
+            "source": source_name,
+            "summary": analyzer.build_summary(),
+        }
+
+        self._write_text_report(report)
+        self._write_json_report(report)
+
+        return (
+            self.text_file,
+            self.json_file,
+        )
+
+    def _write_json_report(
+        self,
+        report: dict[str, Any],
+    ) -> None:
+        """Ghi báo cáo có cấu trúc dưới dạng JSON."""
+        with self.json_file.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                report,
+                file,
+                ensure_ascii=False,
+                indent=4,
+            )
+
+    def _write_text_report(
+        self,
+        report: dict[str, Any],
+    ) -> None:
+        """Ghi báo cáo tổng hợp dạng văn bản."""
+        summary = report["summary"]
+
+        lines = [
+            "=" * 68,
+            "WINWATCH - WINDOWS ACTIVITY MONITORING SUMMARY",
+            "=" * 68,
+            f"Project : {report['project']}",
+            f"Author  : {report['author']}",
+            f"Source  : {report['source']}",
+            "",
+            f"Total Events : {summary['total_events']}",
+            "",
+            "EVENT STATISTICS",
+            "-" * 68,
+        ]
+
+        event_counts = summary[
+            "event_counts"
+        ]
+
+        if event_counts:
+            for event_type in sorted(
+                event_counts
+            ):
+                lines.append(
+                    f"{event_type:<24} "
+                    f": {event_counts[event_type]}"
+                )
+        else:
+            lines.append(
+                "No events available."
+            )
+
+        lines.extend(
+            [
+                "",
+                "PROCESS STATISTICS",
+                "-" * 68,
+                (
+                    "Unique Processes        : "
+                    f"{summary['unique_process_count']}"
+                ),
+            ]
+        )
+
+        top_processes = summary[
+            "top_processes"
+        ]
+
+        if top_processes:
+            for position, (
+                process_name,
+                count,
+            ) in enumerate(
+                top_processes,
+                start=1,
+            ):
+                lines.append(
+                    f"{position}. "
+                    f"{process_name:<30} "
+                    f"{count}"
+                )
+
+        lines.extend(
+            [
+                "",
+                "NETWORK STATISTICS",
+                "-" * 68,
+                (
+                    "Unique Destination IPs  : "
+                    f"{summary['unique_destination_ip_count']}"
+                ),
+            ]
+        )
+
+        top_ips = summary[
+            "top_destination_ips"
+        ]
+
+        if top_ips:
+            for position, (
+                destination_ip,
+                count,
+            ) in enumerate(
+                top_ips,
+                start=1,
+            ):
+                lines.append(
+                    f"{position}. "
+                    f"{destination_ip:<30} "
+                    f"{count}"
+                )
+
+        lines.extend(
+            [
+                "",
+                "LOGIN FAILURE STATISTICS",
+                "-" * 68,
+            ]
+        )
+
+        login_failures = summary[
+            "login_failures"
+        ]
+
+        if login_failures:
+            for username in sorted(
+                login_failures
+            ):
+                lines.append(
+                    f"{username:<30} "
+                    f": {login_failures[username]}"
+                )
+        else:
+            lines.append(
+                "No login failures."
+            )
+
+        lines.extend(
+            [
+                "",
+                "DNS QUERY STATISTICS",
+                "-" * 68,
+            ]
+        )
+
+        dns_queries = summary[
+            "dns_queries"
+        ]
+
+        if dns_queries:
+            ranked_dns = sorted(
+                dns_queries.items(),
+                key=lambda item: (
+                    -item[1],
+                    item[0],
+                ),
+            )[:5]
+
+            for position, (
+                domain,
+                count,
+            ) in enumerate(
+                ranked_dns,
+                start=1,
+            ):
+                lines.append(
+                    f"{position}. "
+                    f"{domain:<38} "
+                    f"{count}"
+                )
+        else:
+            lines.append(
+                "No DNS queries."
+            )
+
+        lines.extend(
+            [
+                "",
+                "=" * 68,
+                "END OF REPORT",
+                "=" * 68,
+            ]
+        )
+
+        with self.text_file.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            file.write(
+                "\n".join(lines)
+                + "\n"
+            )
+
+==============================================================================
+FILE: ubuntu_server/server.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/server.py
+
+Chức năng:
+    Cung cấp TCP server cho Ubuntu Monitoring Server.
+
+    Server thực hiện:
+        - Lắng nghe kết nối từ Windows Client.
+        - Giới hạn client được phép kết nối.
+        - Nhận từng JSON event theo giao thức một dòng / một event.
+        - Kiểm tra UTF-8 và JSON.
+        - Chuyển dữ liệu thành SecurityEvent object.
+        - Validate dữ liệu.
+        - Lưu event xuống JSONL/CSV.
+        - Đưa event vào EventAnalyzer.
+        - Hiển thị sự kiện theo thời gian thực.
+
+Giao thức:
+    Mỗi sự kiện được gửi dưới dạng một JSON object UTF-8
+    và kết thúc bằng ký tự newline (\\n).
+
+Tác giả:
+    Nguyễn Thành Nhân
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import socketserver
+import threading
+from typing import Any
+
+from ubuntu_server.analyzer import EventAnalyzer
+from ubuntu_server.event_store import (
+    EventStorageError,
+    EventStore,
+)
+from ubuntu_server.models import SecurityEvent
+from ubuntu_server.settings import (
+    ALLOWED_CLIENT_IPS,
+    MAX_EVENT_BYTES,
+    SERVER_HOST,
+    SERVER_PORT,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def decode_event_payload(
+    raw_payload: bytes,
+) -> SecurityEvent:
+    """
+    Chuyển một JSON payload nhận qua TCP thành SecurityEvent.
+
+    Args:
+        raw_payload:
+            Dữ liệu UTF-8 JSON nhận từ Windows Agent.
+
+    Returns:
+        SecurityEvent đã được tạo từ payload.
+
+    Raises:
+        UnicodeDecodeError:
+            Khi payload không phải UTF-8 hợp lệ.
+
+        json.JSONDecodeError:
+            Khi payload không phải JSON hợp lệ.
+
+        ValueError:
+            Khi JSON không phải object hoặc dữ liệu event sai kiểu.
+    """
+    payload_text = raw_payload.decode("utf-8")
+
+    payload: Any = json.loads(payload_text)
+
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "JSON event phải là một object."
+        )
+
+    return SecurityEvent.from_dict(payload)
+
+
+def format_realtime_event(
+    event: SecurityEvent,
+) -> str:
+    """
+    Tạo một dòng thông tin ngắn để hiển thị realtime.
+    """
+    return (
+        f"[{event.timestamp}] "
+        f"{event.hostname:<18} "
+        f"{event.event_type:<20} "
+        f"{event.summary()}"
+    )
+
+
+class WinWatchRequestHandler(
+    socketserver.StreamRequestHandler
+):
+    """
+    Xử lý một kết nối TCP từ Windows Agent.
+    """
+
+    def handle(self) -> None:
+        client_ip = self.client_address[0]
+
+        logger.info(
+            "Client connected: %s",
+            client_ip,
+        )
+
+        while True:
+            # Đọc tối đa MAX_EVENT_BYTES + 1 để phát hiện payload
+            # vượt giới hạn mà không nạp dữ liệu tùy ý vào bộ nhớ.
+            raw_payload = self.rfile.readline(
+                MAX_EVENT_BYTES + 1
+            )
+
+            if not raw_payload:
+                break
+
+            if len(raw_payload) > MAX_EVENT_BYTES:
+                logger.warning(
+                    "Rejected oversized event from %s",
+                    client_ip,
+                )
+
+                # Kết thúc connection vì phần còn lại của event dài
+                # có thể khiến framing newline không còn đồng bộ.
+                break
+
+            raw_payload = raw_payload.strip()
+
+            if not raw_payload:
+                continue
+
+            try:
+                event = decode_event_payload(
+                    raw_payload
+                )
+
+                # EventStore validate trước khi ghi dữ liệu.
+                self.server.event_store.save_event(
+                    event
+                )
+
+                # Analyzer được chia sẻ giữa các handler.
+                # Lock đảm bảo cập nhật danh sách event có kiểm soát.
+                with self.server.analyzer_lock:
+                    self.server.analyzer.add_event(
+                        event
+                    )
+
+                print(
+                    format_realtime_event(event),
+                    flush=True,
+                )
+
+            except UnicodeDecodeError as error:
+                logger.warning(
+                    "Invalid UTF-8 from %s: %s",
+                    client_ip,
+                    error,
+                )
+
+            except json.JSONDecodeError as error:
+                logger.warning(
+                    "Invalid JSON from %s: %s",
+                    client_ip,
+                    error,
+                )
+
+            except (
+                TypeError,
+                ValueError,
+                EventStorageError,
+            ) as error:
+                logger.warning(
+                    "Rejected event from %s: %s",
+                    client_ip,
+                    error,
+                )
+
+        logger.info(
+            "Client disconnected: %s",
+            client_ip,
+        )
+
+
+class WinWatchTCPServer(
+    socketserver.ThreadingMixIn,
+    socketserver.TCPServer,
+):
+    """
+    TCP server đa luồng của WinWatch.
+
+    EventStore và EventAnalyzer được chia sẻ cho tất cả client handler.
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        event_store: EventStore,
+        analyzer: EventAnalyzer,
+        allowed_client_ips: set[str] | None = None,
+    ) -> None:
+        self.event_store = event_store
+        self.analyzer = analyzer
+        self.analyzer_lock = threading.Lock()
+
+        self.allowed_client_ips = (
+            set(allowed_client_ips)
+            if allowed_client_ips is not None
+            else set()
+        )
+
+        super().__init__(
+            server_address,
+            WinWatchRequestHandler,
+        )
+
+    def verify_request(
+        self,
+        request: Any,
+        client_address: tuple[str, int],
+    ) -> bool:
+        """
+        Kiểm tra IP client trước khi tạo request handler.
+
+        Nếu allowed_client_ips rỗng, server cho phép mọi client.
+        Trong lab WinWatch, danh sách này được cấu hình giới hạn.
+        """
+        client_ip = client_address[0]
+
+        if not self.allowed_client_ips:
+            return True
+
+        is_allowed = (
+            client_ip
+            in self.allowed_client_ips
+        )
+
+        if not is_allowed:
+            logger.warning(
+                "Rejected connection from unauthorized IP: %s",
+                client_ip,
+            )
+
+        return is_allowed
+
+
+def create_server(
+    host: str = SERVER_HOST,
+    port: int = SERVER_PORT,
+    event_store: EventStore | None = None,
+    analyzer: EventAnalyzer | None = None,
+    allowed_client_ips: set[str] | None = None,
+) -> WinWatchTCPServer:
+    """
+    Khởi tạo WinWatchTCPServer.
+
+    Hàm factory giúp unit test có thể sử dụng localhost,
+    port ngẫu nhiên và file dữ liệu tạm.
+    """
+    store = (
+        event_store
+        if event_store is not None
+        else EventStore()
+    )
+
+    event_analyzer = (
+        analyzer
+        if analyzer is not None
+        else EventAnalyzer()
+    )
+
+    allowed_ips = (
+        ALLOWED_CLIENT_IPS
+        if allowed_client_ips is None
+        else allowed_client_ips
+    )
+
+    return WinWatchTCPServer(
+        (host, port),
+        event_store=store,
+        analyzer=event_analyzer,
+        allowed_client_ips=allowed_ips,
+    )
+
+==============================================================================
+FILE: ubuntu_server/dashboard.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/dashboard.py
+
+Chức năng:
+    Cung cấp Web Dashboard cho WinWatch bằng Python standard library.
+
+    Dashboard:
+        - Đọc dữ liệu runtime từ events.jsonl.
+        - Phân tích dữ liệu bằng EventAnalyzer.
+        - Cung cấp REST-like JSON endpoint.
+        - Hiển thị giao diện web theo thời gian gần thực.
+
+    Không sử dụng framework web bên ngoài.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections import deque
+from http.server import (
+    BaseHTTPRequestHandler,
+    ThreadingHTTPServer,
+)
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from ubuntu_server.analyzer import EventAnalyzer
+from ubuntu_server.models import SecurityEvent
+from ubuntu_server.settings import (
+    EVENTS_JSONL_FILE,
+    PROJECT_ROOT,
+)
+
+
+DASHBOARD_HOST = "0.0.0.0"
+DASHBOARD_PORT = 8080
+
+DASHBOARD_HTML_FILE = (
+    PROJECT_ROOT
+    / "dashboard"
+    / "index.html"
+)
+
+DASHBOARD_CSS_FILE = (
+    PROJECT_ROOT
+    / "dashboard"
+    / "styles.css"
+)
+
+DASHBOARD_JS_FILE = (
+    PROJECT_ROOT
+    / "dashboard"
+    / "app.js"
+)
+
+MAX_EVENTS_TO_ANALYZE = 2000
+RECENT_EVENT_LIMIT = 30
+
+
+def load_runtime_events(
+    jsonl_file: Path = EVENTS_JSONL_FILE,
+    limit: int = MAX_EVENTS_TO_ANALYZE,
+) -> tuple[list[SecurityEvent], list[str]]:
+    """
+    Đọc các SecurityEvent gần nhất từ JSONL.
+
+    File có thể đang được realtime server ghi đồng thời.
+    Các dòng JSON không hoàn chỉnh hoặc không hợp lệ sẽ được bỏ qua
+    thay vì làm dashboard dừng hoạt động.
+
+    Returns:
+        Tuple:
+            - danh sách SecurityEvent hợp lệ.
+            - danh sách thông báo lỗi.
+    """
+    events: list[SecurityEvent] = []
+    errors: list[str] = []
+
+    if not jsonl_file.exists():
+        return events, errors
+
+    try:
+        with jsonl_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            lines = deque(
+                file,
+                maxlen=max(1, limit),
+            )
+
+    except OSError as error:
+        return [], [
+            f"Cannot read {jsonl_file}: {error}"
+        ]
+
+    for index, line in enumerate(
+        lines,
+        start=1,
+    ):
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            payload = json.loads(line)
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                raise ValueError(
+                    "JSON event must be an object."
+                )
+
+            event = SecurityEvent.from_dict(
+                payload
+            )
+
+            is_valid, validation_errors = (
+                event.validate()
+            )
+
+            if not is_valid:
+                raise ValueError(
+                    "; ".join(
+                        validation_errors
+                    )
+                )
+
+            events.append(event)
+
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(
+                f"Runtime row {index}: {error}"
+            )
+
+    return events, errors
+
+
+def build_dashboard_snapshot(
+    events: list[SecurityEvent],
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Tạo snapshot JSON mà Web Dashboard sử dụng.
+
+    Hàm tái sử dụng EventAnalyzer thay vì viết lại logic thống kê.
+    """
+    analyzer = EventAnalyzer(
+        events
+    )
+
+    summary = analyzer.build_summary()
+
+    recent_events: list[
+        dict[str, Any]
+    ] = []
+
+    for event in reversed(
+        events[-RECENT_EVENT_LIMIT:]
+    ):
+        recent_events.append(
+            {
+                "timestamp": event.timestamp,
+                "hostname": event.hostname,
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "username": event.username,
+                "process": (
+                    event.process_basename()
+                ),
+                "source_ip": event.source_ip,
+                "destination_ip": (
+                    event.destination_ip
+                ),
+                "destination_port": (
+                    event.destination_port
+                ),
+                "target_file": (
+                    event.target_file
+                ),
+                "dns_query": event.dns_query,
+                "summary": event.summary(),
+            }
+        )
+
+    event_counts = summary[
+        "event_counts"
+    ]
+
+    return {
+        "status": "online",
+        "last_event_timestamp": (
+            events[-1].timestamp
+            if events
+            else None
+        ),
+        "total_events": summary[
+            "total_events"
+        ],
+        "login_failures": (
+            event_counts.get(
+                "LOGIN_FAILURE",
+                0,
+            )
+        ),
+        "network_connections": (
+            event_counts.get(
+                "NETWORK_CONNECT",
+                0,
+            )
+        ),
+        "unique_processes": summary[
+            "unique_process_count"
+        ],
+        "unique_destination_ips": (
+            summary[
+                "unique_destination_ip_count"
+            ]
+        ),
+        "event_counts": event_counts,
+        "top_processes": summary[
+            "top_processes"
+        ],
+        "top_destination_ips": summary[
+            "top_destination_ips"
+        ],
+        "login_failure_accounts": (
+            summary["login_failures"]
+        ),
+        "dns_queries": summary[
+            "dns_queries"
+        ],
+        "recent_events": recent_events,
+        "data_errors": (
+            errors or []
+        )[-10:],
+    }
+
+
+def get_dashboard_snapshot() -> dict[str, Any]:
+    """Đọc runtime log và tạo dashboard snapshot."""
+    events, errors = (
+        load_runtime_events()
+    )
+
+    return build_dashboard_snapshot(
+        events,
+        errors,
+    )
+
+
+class WinWatchDashboardHandler(
+    BaseHTTPRequestHandler
+):
+    """
+    HTTP request handler của WinWatch Dashboard.
+    """
+
+    server_version = "WinWatchDashboard/1.0"
+
+    def do_GET(self) -> None:
+        """Xử lý HTTP GET request."""
+        path = urlparse(
+            self.path
+        ).path
+
+        if path == "/":
+            self._serve_dashboard()
+            return
+
+        if path == "/static/styles.css":
+            self._serve_static_file(
+                DASHBOARD_CSS_FILE,
+                "text/css; charset=utf-8",
+            )
+            return
+
+        if path == "/static/app.js":
+            self._serve_static_file(
+                DASHBOARD_JS_FILE,
+                "application/javascript; charset=utf-8",
+            )
+            return
+
+        if path == "/api/dashboard":
+            self._serve_dashboard_api()
+            return
+
+        if path == "/api/health":
+            self._send_json(
+                {
+                    "status": "ok",
+                    "service": (
+                        "WinWatch Dashboard"
+                    ),
+                }
+            )
+            return
+
+        self.send_error(
+            404,
+            "Resource not found.",
+        )
+
+    def _serve_dashboard(self) -> None:
+        """Trả giao diện HTML Dashboard."""
+        try:
+            html = (
+                DASHBOARD_HTML_FILE
+                .read_bytes()
+            )
+
+        except OSError as error:
+            logging.error(
+                "Cannot read dashboard HTML: %s",
+                error,
+            )
+
+            self.send_error(
+                500,
+                "Dashboard HTML unavailable.",
+            )
+            return
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(html)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.end_headers()
+        self.wfile.write(html)
+
+    def _serve_static_file(
+        self,
+        file_path: Path,
+        content_type: str,
+    ) -> None:
+        """Serve an approved Dashboard static asset."""
+        try:
+            content = file_path.read_bytes()
+
+        except OSError as error:
+            logging.error(
+                "Cannot read static asset %s: %s",
+                file_path,
+                error,
+            )
+
+            self.send_error(
+                500,
+                "Static asset unavailable.",
+            )
+            return
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            content_type,
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(content)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.end_headers()
+        self.wfile.write(content)
+
+
+    def _serve_dashboard_api(
+        self,
+    ) -> None:
+        """Trả snapshot realtime ở dạng JSON."""
+        snapshot = (
+            get_dashboard_snapshot()
+        )
+
+        self._send_json(snapshot)
+
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Serialize và gửi JSON response."""
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(
+        self,
+        format_string: str,
+        *args: object,
+    ) -> None:
+        """Đưa HTTP access log vào logging."""
+        logging.info(
+            "Dashboard %s - %s",
+            self.client_address[0],
+            format_string % args,
+        )
+
+
+def create_dashboard_server(
+    host: str = DASHBOARD_HOST,
+    port: int = DASHBOARD_PORT,
+) -> ThreadingHTTPServer:
+    """Khởi tạo HTTP Dashboard Server."""
+    return ThreadingHTTPServer(
+        (host, port),
+        WinWatchDashboardHandler,
+    )
+
+
+def configure_logging() -> None:
+    """Cấu hình log cho Dashboard."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def main() -> None:
+    """Entry point của WinWatch Dashboard."""
+    configure_logging()
+
+    try:
+        with create_dashboard_server() as server:
+            print("=" * 72)
+            print(
+                " WINWATCH - WEB MONITORING "
+                "DASHBOARD"
+            )
+            print("=" * 72)
+            print(
+                " Author : Nguyễn Thành Nhân"
+            )
+            print(
+                f" Listen : "
+                f"{DASHBOARD_HOST}:"
+                f"{DASHBOARD_PORT}"
+            )
+            print(
+                " URL    : "
+                "http://192.168.100.138:8080"
+            )
+            print("=" * 72)
+            print(
+                "[+] Dashboard is running."
+            )
+            print(
+                "[+] Press Ctrl+C to stop.\n"
+            )
+
+            server.serve_forever()
+
+    except KeyboardInterrupt:
+        print(
+            "\n[+] Dashboard stopped."
+        )
+
+    except OSError as error:
+        logging.error(
+            "Cannot start Dashboard: %s",
+            error,
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+FILE: ubuntu_server/main.py
+==============================================================================
+"""
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+Module  : ubuntu_server/main.py
+
+Chức năng:
+    Điểm khởi chạy chính của Ubuntu WinWatch Monitoring Server.
+
+    Chương trình hỗ trợ hai chế độ:
+        1. Real-Time Monitoring.
+        2. Offline CSV Analysis.
+
+Tác giả:
+    Nguyễn Thành Nhân
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+
+from ubuntu_server.analyzer import EventAnalyzer
+from ubuntu_server.event_store import EventStore
+from ubuntu_server.file_loader import (
+    CSVLoadError,
+    EventFileLoader,
+)
+from ubuntu_server.report_exporter import (
+    ReportExporter,
+)
+from ubuntu_server.server import create_server
+from ubuntu_server.settings import (
+    ALLOWED_CLIENT_IPS,
+    DATA_DIR,
+    SERVER_HOST,
+    SERVER_PORT,
+    ensure_project_directories,
+)
+
+
+def configure_logging() -> None:
+    """Cấu hình logging của Ubuntu server."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def display_banner() -> None:
+    """Hiển thị thông tin project."""
+    print("=" * 72)
+    print(
+        " WINWATCH - REAL-TIME WINDOWS "
+        "ACTIVITY MONITORING SYSTEM"
+    )
+    print("=" * 72)
+    print(
+        " Author        : Nguyễn Thành Nhân"
+    )
+    print(
+        f" Listen        : "
+        f"{SERVER_HOST}:{SERVER_PORT}"
+    )
+    print(
+        " Allowed IPs   : "
+        + ", ".join(
+            sorted(ALLOWED_CLIENT_IPS)
+        )
+    )
+    print("=" * 72)
+
+
+def run_realtime_server() -> None:
+    """Khởi chạy chế độ giám sát realtime."""
+    event_store = EventStore()
+    analyzer = EventAnalyzer()
+
+    try:
+        with create_server(
+            event_store=event_store,
+            analyzer=analyzer,
+        ) as server:
+            print(
+                "[+] WinWatch server is running."
+            )
+            print(
+                "[+] Press Ctrl+C to stop.\n"
+            )
+
+            server.serve_forever()
+
+    except KeyboardInterrupt:
+        print(
+            "\n[+] WinWatch server stopped by user."
+        )
+
+    except OSError as error:
+        logging.error(
+            "Cannot start WinWatch server: %s",
+            error,
+        )
+
+
+def run_offline_analysis(
+    csv_file: str | Path,
+) -> int:
+    """
+    Đọc dataset CSV, phân tích và xuất báo cáo.
+
+    Returns:
+        0 nếu thành công, 1 nếu không thể đọc dataset.
+    """
+    loader = EventFileLoader()
+
+    try:
+        events, errors = loader.load_csv(
+            csv_file
+        )
+
+    except CSVLoadError as error:
+        logging.error(
+            "Offline analysis failed: %s",
+            error,
+        )
+        return 1
+
+    analyzer = EventAnalyzer(
+        events
+    )
+
+    summary = analyzer.build_summary()
+
+    print("=" * 72)
+    print(" WINWATCH - OFFLINE CSV ANALYSIS")
+    print("=" * 72)
+    print(f" Dataset       : {csv_file}")
+    print(f" Valid Events  : {len(events)}")
+    print(f" Invalid Rows  : {len(errors)}")
+    print("-" * 72)
+
+    for event_type in sorted(
+        summary["event_counts"]
+    ):
+        print(
+            f" {event_type:<24} "
+            f"{summary['event_counts'][event_type]}"
+        )
+
+    if errors:
+        print("\nData Errors:")
+
+        for error in errors:
+            print(
+                f" - {error}"
+            )
+
+    exporter = ReportExporter()
+
+    text_file, json_file = (
+        exporter.export(
+            analyzer,
+            source_name=str(csv_file),
+        )
+    )
+
+    print("-" * 72)
+    print(
+        f" TXT Report    : {text_file}"
+    )
+    print(
+        f" JSON Report   : {json_file}"
+    )
+    print("=" * 72)
+
+    return 0
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Tạo command-line interface của WinWatch."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "WinWatch - Windows Activity "
+            "Monitoring System"
+        )
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command"
+    )
+
+    subparsers.add_parser(
+        "realtime",
+        help=(
+            "Start the real-time "
+            "Windows monitoring server."
+        ),
+    )
+
+    analyze_parser = (
+        subparsers.add_parser(
+            "analyze",
+            help=(
+                "Analyze a CSV dataset "
+                "and export reports."
+            ),
+        )
+    )
+
+    analyze_parser.add_argument(
+        "csv_file",
+        nargs="?",
+        default=str(
+            DATA_DIR
+            / "sample_events.csv"
+        ),
+        help=(
+            "CSV dataset path. "
+            "Default: data/sample_events.csv"
+        ),
+    )
+
+    return parser
+
+
+def main() -> None:
+    """Điểm khởi chạy chính của WinWatch."""
+    configure_logging()
+    ensure_project_directories()
+
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    # Giữ hành vi cũ: không có tham số thì chạy realtime.
+    if args.command in {
+        None,
+        "realtime",
+    }:
+        display_banner()
+        run_realtime_server()
+        return
+
+    if args.command == "analyze":
+        raise SystemExit(
+            run_offline_analysis(
+                args.csv_file
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+FILE: dashboard/index.html
+==============================================================================
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>WinWatch Security Dashboard</title>
+
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+
+<main class="dashboard">
+
+    <header class="topbar">
+
+        <div class="brand">
+
+            <div class="logo">
+                <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                >
+                    <path
+                        d="M12 3 19 6v5c0 4.8-2.8 8.2-7 10-4.2-1.8-7-5.2-7-10V6l7-3Z"
+                    />
+                    <path d="M8.5 12h2l1-3 2 6 1-3h2" />
+                </svg>
+            </div>
+
+            <div class="brand-copy">
+                <h1>WinWatch Security Dashboard</h1>
+
+                <p>
+                    Giám sát hoạt động Windows theo thời gian thực
+                    · Python Security Telemetry
+                    · Nguyễn Thành Nhân
+                </p>
+            </div>
+
+        </div>
+
+        <div class="header-status">
+
+            <div class="meta-pill">
+                TCP Collector
+                <strong>5514</strong>
+            </div>
+
+            <div class="meta-pill">
+                Dashboard
+                <strong>:8080</strong>
+            </div>
+
+            <div class="status-pill">
+                <span
+                    class="status-dot"
+                    id="status-dot"
+                ></span>
+
+                <span id="status-text">
+                    Connecting
+                </span>
+            </div>
+
+        </div>
+
+    </header>
+
+
+    <section class="kpi-grid">
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--cyan);
+                --glow: var(--cyan);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Tổng sự kiện
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <path d="M4 5h16v14H4z"/>
+                        <path d="M8 9h8M8 13h5"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-total"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Telemetry đã thu thập
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--green);
+                --glow: var(--green);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Sự kiện tiến trình
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <rect
+                            x="5"
+                            y="5"
+                            width="14"
+                            height="14"
+                            rx="2"
+                        />
+                        <path d="M9 9h6v6H9z"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-process"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Hoạt động tạo và kết thúc tiến trình
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--blue);
+                --glow: var(--blue);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Kết nối mạng
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <circle cx="12" cy="12" r="8"/>
+                        <path d="M4 12h16M12 4c2 2.2 3 4.8 3 8s-1 5.8-3 8M12 4c-2 2.2-3 4.8-3 8s1 5.8 3 8"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-network"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Telemetry mạng từ Sysmon
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--red);
+                --glow: var(--red);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Đăng nhập thất bại
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <circle cx="12" cy="8" r="3"/>
+                        <path d="M6 19c.8-3 2.8-5 6-5s5.2 2 6 5"/>
+                        <path d="m18 8 3 3M21 8l-3 3"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-login"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Windows Event ID 4625
+            </div>
+        </article>
+
+
+        <article
+            class="kpi"
+            style="
+                --accent: var(--purple);
+                --glow: var(--purple);
+            "
+        >
+            <div class="kpi-header">
+                <span class="kpi-label">
+                    Tiến trình khác nhau
+                </span>
+
+                <span class="kpi-icon">
+                    <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <path d="M5 7h14M5 12h14M5 17h14"/>
+                        <circle cx="8" cy="7" r="1"/>
+                        <circle cx="15" cy="12" r="1"/>
+                        <circle cx="11" cy="17" r="1"/>
+                    </svg>
+                </span>
+            </div>
+
+            <div
+                class="kpi-value"
+                id="kpi-process-unique"
+            >
+                0
+            </div>
+
+            <div class="kpi-sub">
+                Số chương trình thực thi khác nhau
+            </div>
+        </article>
+
+    </section>
+
+
+    <section class="grid-primary">
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ◈
+                    </span>
+
+                    <h2>
+                        Phân bố sự kiện Telemetry
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Dữ liệu thời gian thực
+                </span>
+            </div>
+
+            <div class="panel-body event-overview">
+
+                <div class="donut-wrap">
+
+                    <div
+                        class="donut"
+                        id="event-donut"
+                    >
+                        <div class="donut-center">
+                            <span
+                                class="donut-total"
+                                id="donut-total"
+                            >
+                                0
+                            </span>
+
+                            <span class="donut-caption">
+                                SỰ KIỆN
+                            </span>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div
+                    class="distribution"
+                    id="distribution"
+                >
+                    <div class="empty">
+                        Waiting for telemetry...
+                    </div>
+                </div>
+
+            </div>
+
+        </article>
+
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ◉
+                    </span>
+
+                    <h2>
+                        Trạng thái thiết bị
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Trạng thái giám sát
+                </span>
+            </div>
+
+            <div class="panel-body">
+
+                <div
+                    class="host-name"
+                    id="host-name"
+                >
+                    Đang chờ thiết bị...
+
+                    <span>
+                        Thiết bị Windows được giám sát gần nhất
+                    </span>
+                </div>
+
+                
+                <div class="health-row">
+                    <span class="health-label">
+                        Hoạt động Telemetry
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="agent-health"
+                    >
+                        WAITING
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Telemetry gần nhất
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="last-telemetry"
+                    >
+                        -
+                    </span>
+                </div>
+
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Dashboard API
+                    </span>
+
+                    <span
+                        class="health-value health-good"
+                        id="api-health"
+                    >
+                        ONLINE
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        IP đích duy nhất
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="unique-ip"
+                    >
+                        0
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Lỗi kiểm tra dữ liệu
+                    </span>
+
+                    <span
+                        class="health-value"
+                        id="data-errors"
+                    >
+                        0
+                    </span>
+                </div>
+
+                <div class="health-row">
+                    <span class="health-label">
+                        Tự động cập nhật
+                    </span>
+
+                    <span class="health-value">
+                        2 giây
+                    </span>
+                </div>
+
+            </div>
+
+        </article>
+
+    </section>
+
+
+    <section class="grid-secondary">
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ⌘
+                    </span>
+
+                    <h2>
+                        Tiến trình hoạt động nhiều nhất
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Các chương trình thực thi hoạt động nhiều nhất
+                </span>
+            </div>
+
+            <div class="panel-body">
+
+                <ol
+                    class="ranking"
+                    id="process-ranking"
+                ></ol>
+
+            </div>
+
+        </article>
+
+
+        <article class="panel">
+
+            <div class="panel-heading">
+                <div class="panel-title">
+                    <span class="panel-title-icon">
+                        ◎
+                    </span>
+
+                    <h2>
+                        IP đích phổ biến
+                    </h2>
+                </div>
+
+                <span class="panel-meta">
+                    Các địa chỉ mạng đích
+                </span>
+            </div>
+
+            <div class="panel-body">
+
+                <ol
+                    class="ranking"
+                    id="ip-ranking"
+                ></ol>
+
+            </div>
+
+        </article>
+
+    </section>
+
+
+    <section class="panel events-panel">
+
+        <div class="panel-heading">
+
+            <div class="panel-title">
+                <span class="panel-title-icon">
+                    ≋
+                </span>
+
+                <h2>
+                    Luồng sự kiện Windows trực tiếp
+                </h2>
+            </div>
+
+            <div class="events-toolbar">
+
+                <input
+                    class="search-box"
+                    id="event-search"
+                    type="search"
+                    placeholder="Tìm sự kiện, tiến trình, người dùng..."
+                    aria-label="Tìm kiếm sự kiện"
+                >
+
+                <select
+                    class="event-filter"
+                    id="event-filter"
+                    aria-label="Filter event type"
+                >
+                    <option value="">
+                        Tất cả sự kiện
+                    </option>
+                </select>
+
+            </div>
+
+        </div>
+
+
+        <div class="table-container">
+
+            <table>
+
+                <thead>
+                <tr>
+                    <th>Thời gian</th>
+                    <th>Thiết bị</th>
+                    <th>Loại sự kiện</th>
+                    <th>Người dùng / Tiến trình</th>
+                    <th>Chi tiết</th>
+                </tr>
+                </thead>
+
+                <tbody id="event-table">
+
+                <tr>
+                    <td
+                        colspan="5"
+                        class="empty"
+                    >
+                        Đang chờ telemetry Windows...
+                    </td>
+                </tr>
+
+                </tbody>
+
+            </table>
+
+        </div>
+
+    </section>
+
+
+    <footer>
+        <span>
+            WinWatch · Giám sát hoạt động Windows theo thời gian thực System
+        </span>
+
+        <span id="last-update">
+            Đang chờ lần cập nhật đầu tiên
+        </span>
+    </footer>
+
+</main>
+
+
+<script src="/static/app.js"></script>
+
+</body>
+</html>
+
+==============================================================================
+FILE: dashboard/styles.css
+==============================================================================
+/*
+============================================================================
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+File    : dashboard/styles.css
+Purpose : Styles for WinWatch Security Dashboard
+============================================================================
+*/
+
+:root {
+    --bg: #050b14;
+    --bg-2: #08111f;
+    --surface: rgba(13, 27, 46, 0.88);
+    --surface-2: rgba(18, 37, 61, 0.78);
+    --surface-hover: rgba(25, 49, 79, 0.90);
+
+    --border: rgba(107, 154, 205, 0.18);
+    --border-bright: rgba(79, 183, 255, 0.34);
+
+    --text: #f1f6fd;
+    --text-soft: #b6c7da;
+    --muted: #7890aa;
+
+    --cyan: #39bdf8;
+    --blue: #5d8cff;
+    --green: #3ddc97;
+    --red: #ff647c;
+    --orange: #ffb454;
+    --purple: #a78bfa;
+
+    --shadow:
+        0 18px 50px rgba(0, 0, 0, 0.28);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    color-scheme: dark;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+
+    font-family:
+        Inter,
+        "Segoe UI",
+        system-ui,
+        -apple-system,
+        sans-serif;
+
+    color: var(--text);
+
+    background:
+        radial-gradient(
+            circle at 82% 0%,
+            rgba(44, 91, 170, 0.19),
+            transparent 28%
+        ),
+        radial-gradient(
+            circle at 12% 20%,
+            rgba(57, 189, 248, 0.08),
+            transparent 26%
+        ),
+        linear-gradient(
+            180deg,
+            #060d18,
+            var(--bg)
+        );
+
+    background-attachment: fixed;
+}
+
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.22;
+
+    background-image:
+        linear-gradient(
+            rgba(255, 255, 255, 0.018) 1px,
+            transparent 1px
+        ),
+        linear-gradient(
+            90deg,
+            rgba(255, 255, 255, 0.018) 1px,
+            transparent 1px
+        );
+
+    background-size: 34px 34px;
+}
+
+.dashboard {
+    position: relative;
+    z-index: 1;
+
+    width: min(1580px, calc(100% - 40px));
+    margin: 0 auto;
+    padding: 26px 0 40px;
+}
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+
+    margin-bottom: 24px;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    min-width: 0;
+}
+
+.logo {
+    width: 50px;
+    height: 50px;
+
+    display: grid;
+    place-items: center;
+
+    border-radius: 15px;
+
+    color: var(--cyan);
+
+    border: 1px solid var(--border-bright);
+
+    background:
+        linear-gradient(
+            145deg,
+            rgba(57, 189, 248, 0.16),
+            rgba(93, 140, 255, 0.08)
+        );
+
+    box-shadow:
+        0 0 30px rgba(57, 189, 248, 0.09);
+}
+
+.logo svg {
+    width: 27px;
+    height: 27px;
+}
+
+.brand-copy {
+    min-width: 0;
+}
+
+.brand-copy h1 {
+    margin: 0;
+
+    font-size: clamp(23px, 2vw, 30px);
+    letter-spacing: -0.6px;
+}
+
+.brand-copy p {
+    margin: 5px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.header-status {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 10px;
+}
+
+.status-pill,
+.meta-pill {
+    min-height: 40px;
+
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+
+    padding: 0 14px;
+
+    border: 1px solid var(--border);
+    border-radius: 11px;
+
+    background: rgba(10, 22, 38, 0.82);
+
+    color: var(--text-soft);
+    font-size: 12px;
+}
+
+.status-pill {
+    color: #bdf8da;
+    border-color: rgba(61, 220, 151, 0.25);
+}
+
+.status-dot {
+    width: 9px;
+    height: 9px;
+
+    flex: 0 0 auto;
+
+    border-radius: 50%;
+
+    background: var(--green);
+
+    box-shadow:
+        0 0 0 4px rgba(61, 220, 151, 0.08),
+        0 0 12px var(--green);
+
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    50% {
+        opacity: 0.55;
+        transform: scale(0.9);
+    }
+}
+
+/* =========================================================
+   KPI
+   ========================================================= */
+
+.kpi-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(5, minmax(0, 1fr));
+
+    gap: 14px;
+
+    margin-bottom: 16px;
+}
+
+.kpi {
+    position: relative;
+    overflow: hidden;
+
+    min-height: 126px;
+
+    padding: 18px;
+
+    border-radius: 15px;
+    border: 1px solid var(--border);
+
+    background:
+        linear-gradient(
+            145deg,
+            rgba(17, 35, 58, 0.94),
+            rgba(9, 20, 36, 0.94)
+        );
+
+    box-shadow: var(--shadow);
+}
+
+.kpi::after {
+    content: "";
+
+    position: absolute;
+
+    width: 110px;
+    height: 110px;
+
+    top: -50px;
+    right: -45px;
+
+    border-radius: 50%;
+
+    background: var(--glow);
+    filter: blur(8px);
+    opacity: 0.12;
+}
+
+.kpi-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    gap: 10px;
+}
+
+.kpi-label {
+    color: var(--muted);
+
+    font-size: 11px;
+    font-weight: 700;
+
+    letter-spacing: 0.9px;
+    text-transform: uppercase;
+}
+
+.kpi-icon {
+    width: 31px;
+    height: 31px;
+
+    display: grid;
+    place-items: center;
+
+    color: var(--accent);
+
+    border: 1px solid color-mix(
+        in srgb,
+        var(--accent) 25%,
+        transparent
+    );
+
+    border-radius: 9px;
+
+    background: color-mix(
+        in srgb,
+        var(--accent) 9%,
+        transparent
+    );
+}
+
+.kpi-icon svg {
+    width: 17px;
+    height: 17px;
+}
+
+.kpi-value {
+    margin-top: 13px;
+
+    font-size: 30px;
+    line-height: 1;
+    font-weight: 750;
+
+    color: var(--accent);
+}
+
+.kpi-sub {
+    margin-top: 9px;
+
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* =========================================================
+   PANELS
+   ========================================================= */
+
+.grid-primary {
+    display: grid;
+
+    grid-template-columns:
+        minmax(0, 1.65fr)
+        minmax(300px, 0.72fr);
+
+    gap: 16px;
+
+    margin-bottom: 16px;
+}
+
+.grid-secondary {
+    display: grid;
+
+    grid-template-columns:
+        repeat(2, minmax(0, 1fr));
+
+    gap: 16px;
+
+    margin-bottom: 16px;
+}
+
+.panel {
+    min-width: 0;
+
+    border: 1px solid var(--border);
+    border-radius: 16px;
+
+    background:
+        linear-gradient(
+            145deg,
+            rgba(16, 32, 53, 0.92),
+            rgba(8, 19, 34, 0.94)
+        );
+
+    box-shadow: var(--shadow);
+}
+
+.panel-body {
+    padding: 19px;
+}
+
+.panel-heading {
+    min-height: 59px;
+
+    padding: 0 19px;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    gap: 12px;
+
+    border-bottom:
+        1px solid rgba(123, 163, 204, 0.10);
+}
+
+.panel-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.panel-title h2 {
+    margin: 0;
+
+    font-size: 14px;
+    font-weight: 700;
+}
+
+.panel-title-icon {
+    color: var(--cyan);
+}
+
+.panel-meta {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* =========================================================
+   EVENT OVERVIEW
+   ========================================================= */
+
+.event-overview {
+    display: grid;
+
+    grid-template-columns:
+        210px minmax(0, 1fr);
+
+    gap: 28px;
+    align-items: center;
+}
+
+.donut-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.donut {
+    position: relative;
+
+    width: 165px;
+    height: 165px;
+
+    display: grid;
+    place-items: center;
+
+    border-radius: 50%;
+
+    background:
+        conic-gradient(
+            #203047 0deg 360deg
+        );
+}
+
+.donut::after {
+    content: "";
+
+    width: 116px;
+    height: 116px;
+
+    position: absolute;
+
+    border-radius: 50%;
+
+    border: 1px solid var(--border);
+
+    background:
+        linear-gradient(
+            145deg,
+            #0c1a2b,
+            #07111e
+        );
+}
+
+.donut-center {
+    position: relative;
+    z-index: 2;
+
+    text-align: center;
+}
+
+.donut-total {
+    display: block;
+
+    font-size: 31px;
+    font-weight: 800;
+}
+
+.donut-caption {
+    display: block;
+
+    margin-top: 3px;
+
+    color: var(--muted);
+    font-size: 10px;
+
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+}
+
+.distribution {
+    min-width: 0;
+}
+
+.distribution-row {
+    display: grid;
+
+    grid-template-columns:
+        150px minmax(100px, 1fr) 45px;
+
+    align-items: center;
+
+    gap: 11px;
+
+    margin: 11px 0;
+}
+
+.distribution-name {
+    overflow: hidden;
+
+    color: var(--text-soft);
+
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.track {
+    height: 7px;
+
+    overflow: hidden;
+
+    border-radius: 20px;
+
+    background: rgba(3, 10, 19, 0.85);
+}
+
+.track-fill {
+    height: 100%;
+
+    border-radius: inherit;
+
+    background:
+        linear-gradient(
+            90deg,
+            var(--cyan),
+            var(--purple)
+        );
+
+    box-shadow:
+        0 0 10px rgba(57, 189, 248, 0.15);
+}
+
+.distribution-count {
+    text-align: right;
+
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* =========================================================
+   HOST PROFILE
+   ========================================================= */
+
+.host-name {
+    margin-bottom: 17px;
+
+    font-size: 18px;
+    font-weight: 700;
+}
+
+.host-name span {
+    display: block;
+
+    margin-top: 4px;
+
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 400;
+}
+
+.health-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    gap: 12px;
+
+    padding: 11px 0;
+
+    border-bottom:
+        1px solid rgba(255, 255, 255, 0.055);
+
+    font-size: 12px;
+}
+
+.health-row:last-child {
+    border-bottom: none;
+}
+
+.health-label {
+    color: var(--muted);
+}
+
+.health-value {
+    font-weight: 600;
+}
+
+.health-good {
+    color: var(--green);
+}
+
+/* =========================================================
+   RANKINGS
+   ========================================================= */
+
+.ranking {
+    margin: 0;
+    padding: 0;
+
+    list-style: none;
+}
+
+.ranking-item {
+    display: grid;
+
+    grid-template-columns:
+        33px minmax(0, 1fr) auto;
+
+    gap: 11px;
+    align-items: center;
+
+    padding: 12px 0;
+
+    border-bottom:
+        1px solid rgba(255, 255, 255, 0.055);
+}
+
+.ranking-item:last-child {
+    border-bottom: 0;
+}
+
+.rank-number {
+    width: 28px;
+    height: 28px;
+
+    display: grid;
+    place-items: center;
+
+    border-radius: 8px;
+
+    color: var(--cyan);
+    background: rgba(57, 189, 248, 0.08);
+
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.rank-info {
+    min-width: 0;
+}
+
+.rank-name {
+    overflow: hidden;
+
+    color: var(--text-soft);
+
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    font-size: 12px;
+}
+
+.rank-bar {
+    height: 4px;
+
+    margin-top: 7px;
+
+    overflow: hidden;
+
+    border-radius: 20px;
+
+    background: rgba(0, 0, 0, 0.3);
+}
+
+.rank-bar-fill {
+    height: 100%;
+
+    border-radius: inherit;
+
+    background:
+        linear-gradient(
+            90deg,
+            var(--blue),
+            var(--cyan)
+        );
+}
+
+.rank-count {
+    padding-left: 10px;
+
+    color: var(--muted);
+
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* =========================================================
+   EVENT STREAM
+   ========================================================= */
+
+.events-panel {
+    overflow: hidden;
+}
+
+.events-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.search-box,
+.event-filter {
+    height: 35px;
+
+    color: var(--text-soft);
+    background: rgba(5, 14, 25, 0.75);
+
+    border: 1px solid var(--border);
+    border-radius: 9px;
+
+    outline: none;
+
+    font-family: inherit;
+    font-size: 11px;
+}
+
+.search-box {
+    width: 230px;
+    padding: 0 12px;
+}
+
+.event-filter {
+    padding: 0 10px;
+}
+
+.search-box:focus,
+.event-filter:focus {
+    border-color: var(--border-bright);
+
+    box-shadow:
+        0 0 0 3px rgba(57, 189, 248, 0.07);
+}
+
+.table-container {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    min-width: 1000px;
+
+    border-collapse: collapse;
+}
+
+thead {
+    background: rgba(7, 17, 30, 0.64);
+}
+
+th {
+    padding: 11px 15px;
+
+    text-align: left;
+
+    color: var(--muted);
+
+    font-size: 10px;
+    font-weight: 700;
+
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+}
+
+td {
+    padding: 12px 15px;
+
+    border-top:
+        1px solid rgba(255, 255, 255, 0.045);
+
+    color: var(--text-soft);
+
+    font-size: 11px;
+    vertical-align: middle;
+}
+
+tbody tr {
+    transition:
+        background 0.15s ease;
+}
+
+tbody tr:hover {
+    background:
+        rgba(57, 189, 248, 0.038);
+}
+
+.event-badge {
+    display: inline-flex;
+    align-items: center;
+
+    min-height: 25px;
+
+    padding: 0 8px;
+
+    border-radius: 6px;
+
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: 0.3px;
+
+    border: 1px solid transparent;
+}
+
+.event-process {
+    color: #70e2ac;
+    background: rgba(61, 220, 151, 0.08);
+    border-color: rgba(61, 220, 151, 0.18);
+}
+
+.event-network {
+    color: #7dc9ff;
+    background: rgba(57, 189, 248, 0.08);
+    border-color: rgba(57, 189, 248, 0.18);
+}
+
+.event-login-success {
+    color: #a2f2ca;
+    background: rgba(61, 220, 151, 0.08);
+    border-color: rgba(61, 220, 151, 0.18);
+}
+
+.event-login-failure {
+    color: #ff8fa1;
+    background: rgba(255, 100, 124, 0.09);
+    border-color: rgba(255, 100, 124, 0.20);
+}
+
+.event-file {
+    color: #ffd086;
+    background: rgba(255, 180, 84, 0.08);
+    border-color: rgba(255, 180, 84, 0.18);
+}
+
+.event-dns {
+    color: #c1afff;
+    background: rgba(167, 139, 250, 0.08);
+    border-color: rgba(167, 139, 250, 0.18);
+}
+
+.event-default {
+    color: var(--text-soft);
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--border);
+}
+
+.mono {
+    font-family:
+        "Cascadia Code",
+        Consolas,
+        monospace;
+}
+
+.empty {
+    padding: 28px;
+
+    text-align: center;
+
+    color: var(--muted);
+}
+
+/* =========================================================
+   FOOTER
+   ========================================================= */
+
+footer {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+
+    gap: 10px;
+
+    margin-top: 17px;
+
+    color: var(--muted);
+    font-size: 10px;
+}
+
+/* =========================================================
+   RESPONSIVE
+   ========================================================= */
+
+@media (max-width: 1200px) {
+    .kpi-grid {
+        grid-template-columns:
+            repeat(3, minmax(0, 1fr));
+    }
+
+    .grid-primary {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 850px) {
+    .dashboard {
+        width: min(100% - 24px, 1580px);
+    }
+
+    .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .header-status {
+        justify-content: flex-start;
+    }
+
+    .kpi-grid {
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-secondary {
+        grid-template-columns: 1fr;
+    }
+
+    .event-overview {
+        grid-template-columns: 1fr;
+    }
+
+    .events-toolbar {
+        width: 100%;
+        flex-wrap: wrap;
+    }
+}
+
+@media (max-width: 520px) {
+    .kpi-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .distribution-row {
+        grid-template-columns:
+            115px 1fr 35px;
+    }
+}
+
+==============================================================================
+FILE: dashboard/app.js
+==============================================================================
+/*
+============================================================================
+Project : WinWatch - Real-Time Windows Activity Monitoring System
+Author  : Nguyễn Thành Nhân
+File    : dashboard/app.js
+Purpose : Client-side logic for WinWatch Security Dashboard
+============================================================================
+*/
+
+"use strict";
+
+const REFRESH_INTERVAL = 2000;
+
+let dashboardData = null;
+
+const palette = [
+    "#39bdf8",
+    "#5d8cff",
+    "#3ddc97",
+    "#a78bfa",
+    "#ffb454",
+    "#ff647c",
+    "#55d6be",
+    "#809cff"
+];
+
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+
+function getCount(data, eventType) {
+    return Number(
+        data.event_counts?.[eventType] ?? 0
+    );
+}
+
+
+function eventBadgeClass(eventType) {
+
+    if (eventType === "LOGIN_FAILURE") {
+        return "event-login-failure";
+    }
+
+    if (eventType === "LOGIN_SUCCESS") {
+        return "event-login-success";
+    }
+
+    if (eventType.includes("NETWORK")) {
+        return "event-network";
+    }
+
+    if (eventType.includes("PROCESS")) {
+        return "event-process";
+    }
+
+    if (eventType.includes("DNS")) {
+        return "event-dns";
+    }
+
+    if (eventType.includes("FILE")) {
+        return "event-file";
+    }
+
+    return "event-default";
+}
+
+
+function formatTimestamp(timestamp) {
+
+    if (!timestamp) {
+        return "-";
+    }
+
+    const date = new Date(timestamp);
+
+    if (Number.isNaN(date.getTime())) {
+        return timestamp;
+    }
+
+    return date.toLocaleTimeString(
+        [],
+        {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+        }
+    );
+}
+
+
+function renderKpis(data) {
+
+    const processEvents =
+        getCount(
+            data,
+            "PROCESS_CREATE"
+        )
+        +
+        getCount(
+            data,
+            "PROCESS_TERMINATE"
+        );
+
+    document.getElementById(
+        "kpi-total"
+    ).textContent =
+        data.total_events ?? 0;
+
+    document.getElementById(
+        "kpi-process"
+    ).textContent =
+        processEvents;
+
+    document.getElementById(
+        "kpi-network"
+    ).textContent =
+        data.network_connections ?? 0;
+
+    document.getElementById(
+        "kpi-login"
+    ).textContent =
+        data.login_failures ?? 0;
+
+    document.getElementById(
+        "kpi-process-unique"
+    ).textContent =
+        data.unique_processes ?? 0;
+}
+
+
+function renderDistribution(data) {
+
+    const counts =
+        Object.entries(
+            data.event_counts ?? {}
+        )
+        .filter(
+            ([, count]) =>
+                Number(count) > 0
+        )
+        .sort(
+            (a, b) =>
+                b[1] - a[1]
+        );
+
+    const total =
+        counts.reduce(
+            (sum, [, count]) =>
+                sum + Number(count),
+            0
+        );
+
+    document.getElementById(
+        "donut-total"
+    ).textContent =
+        total;
+
+    const donut =
+        document.getElementById(
+            "event-donut"
+        );
+
+    const distribution =
+        document.getElementById(
+            "distribution"
+        );
+
+    if (counts.length === 0) {
+
+        donut.style.background =
+            "#15243a";
+
+        distribution.innerHTML =
+            '<div class="empty">' +
+            'Chưa có sự kiện.' +
+            '</div>';
+
+        return;
+    }
+
+    let cursor = 0;
+
+    const segments = counts.map(
+        ([, count], index) => {
+
+            const start = cursor;
+
+            const angle =
+                total > 0
+                    ? (
+                        Number(count)
+                        / total
+                    ) * 360
+                    : 0;
+
+            cursor += angle;
+
+            const color =
+                palette[
+                    index % palette.length
+                ];
+
+            return (
+                `${color} ` +
+                `${start}deg ` +
+                `${cursor}deg`
+            );
+        }
+    );
+
+    donut.style.background =
+        `conic-gradient(${segments.join(",")})`;
+
+    const maxValue =
+        Math.max(
+            ...counts.map(
+                ([, count]) =>
+                    Number(count)
+            ),
+            1
+        );
+
+    distribution.innerHTML =
+        counts.map(
+            ([name, count], index) => {
+
+                const percentage =
+                    (
+                        Number(count)
+                        / maxValue
+                    )
+                    * 100;
+
+                const color =
+                    palette[
+                        index % palette.length
+                    ];
+
+                return `
+                    <div class="distribution-row">
+
+                        <div
+                            class="distribution-name"
+                            title="${escapeHtml(name)}"
+                        >
+                            ${escapeHtml(name)}
+                        </div>
+
+                        <div class="track">
+                            <div
+                                class="track-fill"
+                                style="
+                                    width:${percentage}%;
+                                    background:
+                                        linear-gradient(
+                                            90deg,
+                                            ${color},
+                                            ${color}aa
+                                        );
+                                "
+                            ></div>
+                        </div>
+
+                        <div class="distribution-count">
+                            ${count}
+                        </div>
+
+                    </div>
+                `;
+            }
+        )
+        .join("");
+}
+
+
+function renderRanking(
+    elementId,
+    rows
+) {
+
+    const element =
+        document.getElementById(
+            elementId
+        );
+
+    if (!rows || rows.length === 0) {
+
+        element.innerHTML =
+            '<li class="empty">' +
+            'Chưa có dữ liệu.' +
+            '</li>';
+
+        return;
+    }
+
+    const topRows =
+        rows.slice(0, 6);
+
+    const maximum =
+        Math.max(
+            ...topRows.map(
+                row => Number(row[1])
+            ),
+            1
+        );
+
+    element.innerHTML =
+        topRows.map(
+            ([name, count], index) => {
+
+                const width =
+                    (
+                        Number(count)
+                        / maximum
+                    )
+                    * 100;
+
+                return `
+                    <li class="ranking-item">
+
+                        <span class="rank-number">
+                            ${index + 1}
+                        </span>
+
+                        <div class="rank-info">
+
+                            <div
+                                class="rank-name"
+                                title="${escapeHtml(name)}"
+                            >
+                                ${escapeHtml(name)}
+                            </div>
+
+                            <div class="rank-bar">
+                                <div
+                                    class="rank-bar-fill"
+                                    style="width:${width}%"
+                                ></div>
+                            </div>
+
+                        </div>
+
+                        <span class="rank-count">
+                            ${count}
+                        </span>
+
+                    </li>
+                `;
+            }
+        )
+        .join("");
+}
+
+
+function parseTelemetryTimestamp(timestamp) {
+
+    if (!timestamp) {
+        return null;
+    }
+
+    /*
+     * Sysmon may produce timestamps with seven
+     * fractional-second digits, for example:
+     *
+     * 2026-08-10T17:13:16.6987159Z
+     *
+     * JavaScript engines are most reliable with
+     * millisecond precision, so truncate the
+     * fractional part to three digits.
+     */
+    const normalized =
+        String(timestamp)
+        .trim()
+        .replace(
+            /(\.\d{3})\d+(Z|[+-]\d{2}:\d{2})$/,
+            "$1$2"
+        );
+
+    const milliseconds =
+        Date.parse(normalized);
+
+    if (
+        Number.isNaN(
+            milliseconds
+        )
+    ) {
+        return null;
+    }
+
+    return milliseconds;
+}
+
+
+function formatTelemetryAge(ageSeconds) {
+
+    if (ageSeconds < 60) {
+        return `${ageSeconds} giây trước`;
+    }
+
+    const minutes =
+        Math.floor(
+            ageSeconds / 60
+        );
+
+    if (minutes < 60) {
+
+        const remainingSeconds =
+            ageSeconds % 60;
+
+        if (remainingSeconds === 0) {
+            return `${minutes} phút trước`;
+        }
+
+        return (
+            `${minutes} phút ` +
+            `${remainingSeconds} giây trước`
+        );
+    }
+
+    const hours =
+        Math.floor(
+            minutes / 60
+        );
+
+    const remainingMinutes =
+        minutes % 60;
+
+    if (remainingMinutes === 0) {
+        return `${hours} giờ trước`;
+    }
+
+    return (
+        `${hours} giờ ` +
+        `${remainingMinutes} phút trước`
+    );
+}
+
+
+function getTelemetryStatus(timestamp) {
+
+    if (!timestamp) {
+        return {
+            label: "WAITING",
+            text: "Chưa nhận được telemetry",
+            color: "var(--muted)"
+        };
+    }
+
+    const eventTime =
+        parseTelemetryTimestamp(
+            timestamp
+        );
+
+    if (eventTime === null) {
+        return {
+            label: "UNKNOWN",
+            text: "Mốc thời gian không hợp lệ",
+            color: "var(--muted)"
+        };
+    }
+
+    const ageSeconds =
+        Math.max(
+            0,
+            Math.floor(
+                (
+                    Date.now()
+                    - eventTime
+                )
+                / 1000
+            )
+        );
+
+    if (ageSeconds <= 15) {
+        return {
+            label: "ACTIVE",
+            text: formatTelemetryAge(
+                ageSeconds
+            ),
+            color: "var(--green)"
+        };
+    }
+
+    if (ageSeconds <= 60) {
+        return {
+            label: "IDLE",
+            text: formatTelemetryAge(
+                ageSeconds
+            ),
+            color: "var(--orange)"
+        };
+    }
+
+    return {
+        label: "STALE",
+        text: formatTelemetryAge(
+            ageSeconds
+        ),
+        color: "var(--red)"
+    };
+}
+
+
+function renderEndpoint(data) {
+
+    const latest =
+        data.recent_events?.[0];
+
+    document.getElementById(
+        "host-name"
+    ).innerHTML =
+        latest?.hostname
+            ? (
+                escapeHtml(
+                    latest.hostname
+                )
+                +
+                "<span>" +
+                "Thiết bị Windows được giám sát gần nhất" +
+                "</span>"
+            )
+            : (
+                "Đang chờ thiết bị..." +
+                "<span>" +
+                "Chưa nhận được sự kiện Windows" +
+                "</span>"
+            );
+
+    const telemetryStatus =
+        getTelemetryStatus(
+            data.last_event_timestamp
+        );
+
+    const telemetryActivity =
+        document.getElementById(
+            "agent-health"
+        );
+
+    telemetryActivity.textContent =
+        telemetryStatus.label;
+
+    telemetryActivity.style.color =
+        telemetryStatus.color;
+
+    document.getElementById(
+        "last-telemetry"
+    ).textContent =
+        telemetryStatus.text;
+
+
+    document.getElementById(
+        "unique-ip"
+    ).textContent =
+        data.unique_destination_ips ?? 0;
+
+    document.getElementById(
+        "data-errors"
+    ).textContent =
+        data.data_errors?.length ?? 0;
+}
+
+
+function populateEventFilter(data) {
+
+    const select =
+        document.getElementById(
+            "event-filter"
+        );
+
+    const previousValue =
+        select.value;
+
+    const eventTypes =
+        Object.keys(
+            data.event_counts ?? {}
+        )
+        .sort();
+
+    select.innerHTML =
+        '<option value="">' +
+        'Tất cả sự kiện' +
+        '</option>'
+        +
+        eventTypes.map(
+            eventType => `
+                <option
+                    value="${escapeHtml(eventType)}"
+                >
+                    ${escapeHtml(eventType)}
+                </option>
+            `
+        )
+        .join("");
+
+    if (
+        eventTypes.includes(
+            previousValue
+        )
+    ) {
+        select.value =
+            previousValue;
+    }
+}
+
+
+function renderEvents() {
+
+    const table =
+        document.getElementById(
+            "event-table"
+        );
+
+    if (!dashboardData) {
+        return;
+    }
+
+    const searchValue =
+        document.getElementById(
+            "event-search"
+        )
+        .value
+        .trim()
+        .toLowerCase();
+
+    const eventType =
+        document.getElementById(
+            "event-filter"
+        ).value;
+
+    const events =
+        dashboardData.recent_events
+        ?? [];
+
+    const filtered =
+        events.filter(
+            event => {
+
+                if (
+                    eventType
+                    &&
+                    event.event_type
+                    !== eventType
+                ) {
+                    return false;
+                }
+
+                if (!searchValue) {
+                    return true;
+                }
+
+                const searchable = [
+                    event.timestamp,
+                    event.hostname,
+                    event.event_type,
+                    event.username,
+                    event.process,
+                    event.source_ip,
+                    event.destination_ip,
+                    event.target_file,
+                    event.dns_query,
+                    event.summary
+                ]
+                .join(" ")
+                .toLowerCase();
+
+                return searchable.includes(
+                    searchValue
+                );
+            }
+        );
+
+    if (filtered.length === 0) {
+
+        table.innerHTML = `
+            <tr>
+                <td
+                    colspan="5"
+                    class="empty"
+                >
+                    Không có sự kiện phù hợp.
+                </td>
+            </tr>
+        `;
+
+        return;
+    }
+
+    table.innerHTML =
+        filtered.map(
+            event => {
+
+                const identity =
+                    event.username
+                    ||
+                    event.process
+                    ||
+                    "-";
+
+                return `
+                    <tr>
+
+                        <td class="mono">
+                            ${escapeHtml(
+                                formatTimestamp(
+                                    event.timestamp
+                                )
+                            )}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                event.hostname
+                            )}
+                        </td>
+
+                        <td>
+                            <span
+                                class="
+                                    event-badge
+                                    ${eventBadgeClass(
+                                        event.event_type
+                                    )}
+                                "
+                            >
+                                ${escapeHtml(
+                                    event.event_type
+                                )}
+                            </span>
+                        </td>
+
+                        <td class="mono">
+                            ${escapeHtml(identity)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                event.summary
+                            )}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        )
+        .join("");
+}
+
+
+function renderDashboard(data) {
+
+    dashboardData = data;
+
+    renderKpis(data);
+    renderDistribution(data);
+
+    renderRanking(
+        "process-ranking",
+        data.top_processes
+    );
+
+    renderRanking(
+        "ip-ranking",
+        data.top_destination_ips
+    );
+
+    renderEndpoint(data);
+    populateEventFilter(data);
+    renderEvents();
+
+    document.getElementById(
+        "last-update"
+    ).textContent =
+        "Cập nhật lần cuối: "
+        +
+        new Date()
+            .toLocaleTimeString();
+
+    document.getElementById(
+        "status-text"
+    ).textContent =
+        "Giám sát ONLINE";
+
+    document.getElementById(
+        "api-health"
+    ).textContent =
+        "ONLINE";
+}
+
+
+async function refreshDashboard() {
+
+    const statusText =
+        document.getElementById(
+            "status-text"
+        );
+
+    const statusDot =
+        document.getElementById(
+            "status-dot"
+        );
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/dashboard",
+                {
+                    cache: "no-store"
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}`
+            );
+        }
+
+        const data =
+            await response.json();
+
+        statusDot.style.background =
+            "var(--green)";
+
+        renderDashboard(data);
+
+    } catch (error) {
+
+        statusText.textContent =
+            "Dashboard API OFFLINE";
+
+        statusDot.style.background =
+            "var(--red)";
+
+        document.getElementById(
+            "api-health"
+        ).textContent =
+            "OFFLINE";
+
+        console.error(
+            "Dashboard refresh failed:",
+            error
+        );
+    }
+}
+
+
+document.getElementById(
+    "event-search"
+).addEventListener(
+    "input",
+    renderEvents
+);
+
+
+document.getElementById(
+    "event-filter"
+).addEventListener(
+    "change",
+    renderEvents
+);
+
+
+refreshDashboard();
+
+setInterval(
+    refreshDashboard,
+    REFRESH_INTERVAL
+);
+
+==============================================================================
+FILE: README.md
+==============================================================================
+# WinWatch
+
+**Project:** WinWatch - Real-Time Windows Activity Monitoring System
+
+**Tác giả:** Nguyễn Thành Nhân
+
+**Lĩnh vực:** An ninh mạng
+
+## Mục tiêu
+
+WinWatch là hệ thống Python giám sát các sự kiện hệ thống và an ninh
+quan trọng trên Windows Client theo thời gian thực.
+
+Windows Agent thu thập Windows Security Log và Sysmon Event Log,
+chuẩn hóa sự kiện và truyền dữ liệu về Ubuntu Monitoring Server.
+
+Ubuntu Server tiếp nhận, lưu trữ, thống kê, phân tích, phát hiện
+bất thường và xuất báo cáo.
+
+## Các nhóm hoạt động được giám sát
+
+1. Process Create
+2. Process Terminate
+3. Login Success
+4. Login Failure
+5. Network Connect
+6. File Create
+7. File Delete
+8. DNS Query
+
+## Chế độ hoạt động
+
+- Real-Time Monitoring
+- Offline CSV Analysis
+- Event Statistics
+- Detection and Alerts
+- CSV / JSON / TXT Reporting
+
+
+==============================================================================
+FILE: requirements.txt
+==============================================================================
